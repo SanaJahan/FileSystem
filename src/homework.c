@@ -105,7 +105,36 @@ static int lookup(int inum, const char *name)
  */
 static int parse(char *path, char *names[], int nnames)
 {
-	return 0;
+    char *token = NULL;
+    //char mpath[40] = "/users/documents/test.txt/..";
+    char mpath[40];
+    strcpy(mpath, path);
+    char* delim = "/";
+    names[nnames] = NULL;
+    int num_tokens = 0;
+    //char *mydelim = "/";
+
+    /* get the first token */
+    token = strtok(mpath, delim);
+    //names[0] = token;
+
+    int i = 0;
+    /* walk through other tokens */
+    while( token != NULL ) {
+        if(!(strcmp(token, ".")==0 || strcmp(token, "..")==0 )){
+            char *tokenCopy = malloc(strlen(token));
+            strcpy(tokenCopy, token);
+            names[i] = tokenCopy;
+            //printf( " %s\n", names[i] );
+            i++;
+            num_tokens++;
+        }
+        token = strtok(NULL, delim);
+
+
+    }
+    //printf("No. of tokens: %d\n", num_tokens);
+	return num_tokens;
 }
 
 /* Return inode number for specified file or directory.
@@ -120,7 +149,39 @@ static int parse(char *path, char *names[], int nnames)
 static int translate(const char *path)
 {
 	// note: make copy of path before passing to parse()
-    return -EOPNOTSUPP;
+	// note: make copy of path before passing to parse()
+	char *file_path = strdup(path);
+	char *names[64] = {NULL};
+	int token_number = parse(file_path, names, 0);
+	int the_inode = root_inode;
+	void *block;
+	block = malloc(FS_BLOCK_SIZE);
+	struct fs_dirent *fd;
+	struct fs_inode temp;
+	for (int i = 0; i < token_number; i++) {
+		const char *file_name =(const char *) names[i];
+		temp = inodes[the_inode];
+		disk->ops->read(disk, temp.direct[0], 1, block);
+		fd = block;
+		int index = 0;
+		for (index = 0; index < DIRENTS_PER_BLK; index++) {
+			if (fd->valid && !strcmp(file_name, fd->name)) {
+				if (names[i + 1] != NULL && !fd->isDir) {
+					free(block);
+					return -ENOTDIR;
+				}
+				the_inode = fd->inode;
+				break;
+			}
+			fd++;
+		}
+		if (index == DIRENTS_PER_BLK) {
+			free(block);
+			return ENOENT;
+		}
+	}
+
+    return the_inode;
 }
 
 /**
@@ -325,6 +386,13 @@ static void* fs_init(struct fuse_conn_info *conn)
 
     /* your code here */
 
+    fuse_fill_dir_t filler;
+    void *ptr = filler;
+    off_t offset;
+    struct fuse_file_info *fi;
+    readdir("/dir1", ptr, filler, fi);
+    printf(filler);
+
     return NULL;
 }
 
@@ -354,9 +422,43 @@ static void* fs_init(struct fuse_conn_info *conn)
  * @param sb pointer to stat struct
  * @return 0 if successful, or -error number
  */
+
+static void fs_set_attrs(struct fs_inode *inode, struct stat *sb, int inum) {
+    //set attrs from inode to sb
+	sb->st_ino = inum;
+    sb->st_blocks = (inode->size - 1) / FS_BLOCK_SIZE + 1;
+    sb->st_mode = inode->mode;
+    sb->st_size = inode->size;
+    sb->st_uid = inode->uid;
+    sb->st_gid = inode->gid;
+    //set time
+    sb->st_ctime = inode->ctime;
+    sb->st_mtime = inode->mtime;
+    sb->st_atime = sb->st_mtime;
+    sb->st_nlink = 1;
+}
+
 static int fs_getattr(const char *path, struct stat *sb)
 {
-    return -EOPNOTSUPP;
+    int inode_num = translate(path); // read the inode number from the given path
+
+    struct fs_inode inode = inodes[inode_num];
+    fs_set_attrs(&inode, &sb, inode_num);
+
+    // if the entry is not there then return the inode value
+    if (inode_num != -ENOENT || inode_num != -ENOTDIR) {
+            return inode_num;
+       }
+    if (inode_num == -ENOENT) {
+                return -ENOENT;
+        }
+
+    if (inode_num == -ENOTDIR) {
+                return ENOTDIR;
+           }
+
+
+    return 0;
 }
 
 
@@ -380,20 +482,7 @@ static int fs_getattr(const char *path, struct stat *sb)
  * @return 0 if successful, or -error number
  */
 
-static void fs_set_attrs(struct fs_inode *inode, struct stat *sb, int inum) {
-    //set attrs from inode to sb
-	sb->st_ino = inum;
-    sb->st_blocks = (inode->size - 1) / FS_BLOCK_SIZE + 1;
-    sb->st_mode = inode->mode;
-    sb->st_size = inode->size;
-    sb->st_uid = inode->uid;
-    sb->st_gid = inode->gid;
-    //set time
-    sb->st_ctime = inode->ctime;
-    sb->st_mtime = inode->mtime;
-    sb->st_atime = sb->st_mtime;
-    sb->st_nlink = 1;
-}
+
 
 
 static int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
@@ -553,9 +642,80 @@ static int fs_truncate(const char *path, off_t len)
  * @param path path to file
  * @return 0 if successful, or -error number
  */
+
+char *get_last_of_split(char *path) {
+
+    char *token = NULL;
+    char *tokens[64] = {NULL};
+    int i = 0;
+    /* tokenize the string */
+    token = strtok(path, "/");
+    while (token) {
+        tokens[i++] = token;
+        token = strtok(NULL, "/");
+    }
+
+    return tokens[--i];
+}
+
 static int fs_unlink(const char *path)
 {
-    return -EOPNOTSUPP;
+    int i = 0;
+    int inum = fs_truncate(path, 0);
+    if (inum < 0)
+        return inum;
+
+    char dir_name[FS_FILENAME_SIZE];
+    char *_path = strdupa(path);
+    int parent_inum = get_parent_inum(_path, dir_name);
+    _path = strdupa(path);
+    char *last;
+
+    last = get_last_of_split(_path);
+
+    struct fs_inode parent_dir = inodes[parent_inum];
+    struct fs_dirent *block = (struct fs_dirent *) malloc(FS_BLOCK_SIZE);
+    disk->ops->read(disk, parent_dir.direct[0], 1, block);
+
+
+    /* find the inode entry and clear it */
+    for (i = 0; i < 32; i++) {
+
+        if (block[i].valid == 0) {
+            continue;
+        }
+
+        if (strcmp(block[i].name, last) == 0) {
+
+            if (block[i].isDir) {
+                return -EISDIR;
+            }
+            int file_node_num = block[i].inode;
+            struct fs_inode fileinode = inodes[file_node_num];
+            if (FD_ISSET(file_node_num, inode_map)) {
+                FD_CLR(file_node_num, inode_map);
+                fileinode.size = 0;
+                fileinode.mtime = time(NULL);
+                block[i].valid = 0;
+                inodes[file_node_num] = fileinode;
+                break;
+            }
+        }
+    }
+
+
+    if (i > 31) {
+        return -ENOENT;
+    }
+
+    disk->ops->write(disk, parent_dir.direct[0], 1, block);
+    write_all_inodes();
+    //write_block_map();
+    write_inode_map();
+    free(block);
+
+    return 0;
+
 }
 
 /**
@@ -595,7 +755,69 @@ static int fs_rmdir(const char *path)
  */
 static int fs_rename(const char *src_path, const char *dst_path)
 {
-    return -EOPNOTSUPP;
+    //get the old name from src_path
+    char the_old_name[FS_FILENAME_SIZE];
+    char *tmp_path = strdupa(src_path);
+    //get_parent_inum
+    int prev_pinum = translate_1(tmp_path, the_old_name);
+
+    tmp_path = strdupa(src_path);
+    //translate_path_to_inum
+    int curr_inum = translate(tmp_path);
+
+    char the_new_name[FS_FILENAME_SIZE];
+    tmp_path = strdupa(dst_path);
+    int new_pinum = translate_1(tmp_path, the_new_name);
+
+    if (curr_inum == -ENOTDIR || curr_inum == -ENOENT) {
+        return curr_inum;
+    }
+
+    if (prev_pinum != new_pinum) {
+        return -EINVAL;
+    }
+
+    struct fs_inode parent_inode = inodes[prev_pinum];
+    void *block = malloc(FS_BLOCK_SIZE);
+    disk->ops->read(disk, parent_inode.direct[0], 1, block);
+    struct fs_dirent *entry = block;
+
+    /* to check if destination is not present */
+    int i = 0;
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        if (!strcmp(entry->name, the_new_name)) {
+            if (block) {
+                free(block);
+            }
+            return -EEXIST;
+        }
+        entry++;
+    }
+
+    /* update name of matching inode */
+    entry = block;
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        if (entry->inode == curr_inum) {
+            strncpy(entry->name, the_new_name, strlen(the_new_name));
+            struct fs_inode inode = inodes[curr_inum];
+            inode.ctime = time(NULL);
+            inodes[curr_inum] = inode;
+            write_all_inodes();
+            break;
+        }
+        entry++;
+    }
+
+    /* write back to disk */
+    disk->ops->write(disk, parent_inode.direct[0], 1, block);
+
+    /* free previously allocated memory */
+    if (block) {
+        free(block);
+    }
+
+    return 0;
+
 }
 
 /**
