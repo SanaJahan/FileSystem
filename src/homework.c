@@ -643,76 +643,9 @@ static int fs_truncate(const char *path, off_t len)
  * @return 0 if successful, or -error number
  */
 
-char *get_last_of_split(char *path) {
-
-    char *token = NULL;
-    char *tokens[64] = {NULL};
-    int i = 0;
-    /* tokenize the string */
-    token = strtok(path, "/");
-    while (token) {
-        tokens[i++] = token;
-        token = strtok(NULL, "/");
-    }
-
-    return tokens[--i];
-}
 
 static int fs_unlink(const char *path)
 {
-    int i = 0;
-    int inum = fs_truncate(path, 0);
-    if (inum < 0)
-        return inum;
-
-    char dir_name[FS_FILENAME_SIZE];
-    char *_path = strdupa(path);
-    int parent_inum = get_parent_inum(_path, dir_name);
-    _path = strdupa(path);
-    char *last;
-
-    last = get_last_of_split(_path);
-
-    struct fs_inode parent_dir = inodes[parent_inum];
-    struct fs_dirent *block = (struct fs_dirent *) malloc(FS_BLOCK_SIZE);
-    disk->ops->read(disk, parent_dir.direct[0], 1, block);
-
-
-    /* find the inode entry and clear it */
-    for (i = 0; i < 32; i++) {
-
-        if (block[i].valid == 0) {
-            continue;
-        }
-
-        if (strcmp(block[i].name, last) == 0) {
-
-            if (block[i].isDir) {
-                return -EISDIR;
-            }
-            int file_node_num = block[i].inode;
-            struct fs_inode fileinode = inodes[file_node_num];
-            if (FD_ISSET(file_node_num, inode_map)) {
-                FD_CLR(file_node_num, inode_map);
-                fileinode.size = 0;
-                fileinode.mtime = time(NULL);
-                block[i].valid = 0;
-                inodes[file_node_num] = fileinode;
-                break;
-            }
-        }
-    }
-
-
-    if (i > 31) {
-        return -ENOENT;
-    }
-
-    disk->ops->write(disk, parent_dir.direct[0], 1, block);
-    write_all_inodes();
-    //write_block_map();
-    write_inode_map();
-    free(block);
 
     return 0;
 
