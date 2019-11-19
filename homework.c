@@ -362,7 +362,66 @@ static int is_empty_dir(struct fs_dirent *de)
  */
 static int get_blk(struct fs_inode *in, int n, int alloc)
 {
-    return -ENOSPC;
+    // Let's assume n=1000 for inode 7 (size = 276177 bytes)
+    float file_size_bytes = (float)in->size;
+    
+    // convert bytes to block size
+    float file_size_blocks = (ceil)(file_size_bytes / FS_BLOCK_SIZE);
+    
+    int retVal = -1;    // initialize retVal to -1 which is invalid block no
+    
+    // if n is between 0 to 5, access the direct blocks = 6 blocks
+    if(n < N_DIRECT){
+        retVal = in->direct[n];
+    }
+    
+    // if n is between 6 to 255: access indirect1 block
+    else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
+        int indir_block_1 = in->indir_1;
+        printf("Ptrs per blk: %d, indirBlk: %d\n", PTRS_PER_BLK, indir_block_1);
+        int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
+            exit(2);
+        }
+        retVal = ptr_to_indir1[n-N_DIRECT]; // returns nth block from indirect blocks
+    }
+    
+    // else if n = 256 or greater : access the indir2 block
+    else if(n >= (N_DIRECT + PTRS_PER_BLK)){
+        
+        // if n = 1000, adjusted_n = 1000 - 262 = 738
+        int adjusted_n = n - (N_DIRECT + PTRS_PER_BLK);
+        
+        // find indirect2 block num & read the block
+        int indir_block_2 = in->indir_2;
+        int* ptr_to_indir2 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_2, 1, ptr_to_indir2) < 0) {
+            exit(2);
+        }
+        
+        // find the block index in indirect2 block that we will read, get ceil
+        // ceil(738 / 256) = 3.0
+        double index_from_indir2 = (ceil)(adjusted_n / PTRS_PER_BLK);
+        
+        // convert to int = 3 for dereferencing
+        int index_from_indir2_int = (int)(index_from_indir2);
+        
+        // get block number that we will finally read from (second level block)
+        // i.e. read from the third block in indirect2
+        int block_num_in_indirect = ptr_to_indir2[index_from_indir2_int];
+        int* myptr = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, block_num_in_indirect , 1, myptr) < 0) {
+            exit(2);
+        }
+        
+        // target index = 738 % 256 = 226. Hence, we read the block at index 226 from the 3rd block that we had located
+        int target_idx = adjusted_n % PTRS_PER_BLK;
+        
+        retVal = myptr[target_idx];
+        
+    }
+    return retVal;
+    /** Need to update this function with logic for alloc */
 }
 
 /* Fuse functions
