@@ -105,7 +105,7 @@ static int lookup(int inum, const char *name)
  */
 static int parse(char *path, char *names[], int nnames)
 {
-	printf("enter parse... \n");
+
     char *token = NULL;
     //char mpath[40] = "/users/documents/test.txt/..";
     char mpath[40];
@@ -150,12 +150,11 @@ static int parse(char *path, char *names[], int nnames)
 static int translate(const char *path)
 {
 	// note: make copy of path before passing to parse()
-	// note: make copy of path before passing to parse()
-	printf("enter translate, path is : %s\n", path);
+
 	char *file_path = strdup(path);
 	char *names[64] = {NULL};
 	int token_number = parse(file_path, names, 0);
-	printf("called parse, returned token_number %d\n", token_number);
+
 	int the_inode = root_inode;
 	void *block;
 	block = malloc(FS_BLOCK_SIZE);
