@@ -105,6 +105,7 @@ static int lookup(int inum, const char *name)
  */
 static int parse(char *path, char *names[], int nnames)
 {
+	printf("enter parse... \n");
     char *token = NULL;
     //char mpath[40] = "/users/documents/test.txt/..";
     char mpath[40];
@@ -150,9 +151,11 @@ static int translate(const char *path)
 {
 	// note: make copy of path before passing to parse()
 	// note: make copy of path before passing to parse()
+	printf("enter translate, path is : %s\n", path);
 	char *file_path = strdup(path);
 	char *names[64] = {NULL};
 	int token_number = parse(file_path, names, 0);
+	printf("called parse, returned token_number %d\n", token_number);
 	int the_inode = root_inode;
 	void *block;
 	block = malloc(FS_BLOCK_SIZE);
@@ -386,15 +389,34 @@ static void* fs_init(struct fuse_conn_info *conn)
 
     /* your code here */
 
-    fuse_fill_dir_t filler;
-    void *ptr = filler;
-    off_t offset;
-    struct fuse_file_info *fi;
-    readdir("/dir1", ptr, filler, fi);
-    printf(filler);
+
+
 
     return NULL;
 }
+
+
+/**
+ * fs_set_attrs - set attrs from inode to sb
+ *
+ * @param pointer to inode
+ * @param sb pointer to stat struct
+ *
+ */
+static void fs_set_attrs(struct fs_inode *inode, struct stat *sb, int inum) {
+	sb->st_ino = inum;
+    sb->st_blocks = (inode->size - 1) / FS_BLOCK_SIZE + 1;
+    sb->st_mode = inode->mode;
+    sb->st_size = inode->size;
+    sb->st_uid = inode->uid;
+    sb->st_gid = inode->gid;
+    //set time
+    sb->st_ctime = inode->ctime;
+    sb->st_mtime = inode->mtime;
+    sb->st_atime = sb->st_mtime;
+    sb->st_nlink = 1;
+}
+
 
 /* Note on path translation errors:
  * In addition to the method-specific errors listed below, almost
@@ -423,43 +445,24 @@ static void* fs_init(struct fuse_conn_info *conn)
  * @return 0 if successful, or -error number
  */
 
-static void fs_set_attrs(struct fs_inode *inode, struct stat *sb, int inum) {
-    //set attrs from inode to sb
-	sb->st_ino = inum;
-    sb->st_blocks = (inode->size - 1) / FS_BLOCK_SIZE + 1;
-    sb->st_mode = inode->mode;
-    sb->st_size = inode->size;
-    sb->st_uid = inode->uid;
-    sb->st_gid = inode->gid;
-    //set time
-    sb->st_ctime = inode->ctime;
-    sb->st_mtime = inode->mtime;
-    sb->st_atime = sb->st_mtime;
-    sb->st_nlink = 1;
-}
+
+
 
 static int fs_getattr(const char *path, struct stat *sb)
 {
+
     int inode_num = translate(path); // read the inode number from the given path
 
-    struct fs_inode inode = inodes[inode_num];
-    fs_set_attrs(&inode, &sb, inode_num);
+    if (inode_num == -ENOENT || inode_num == -ENOTDIR) {
+    	return inode_num;
+    }
 
-    // if the entry is not there then return the inode value
-    if (inode_num != -ENOENT || inode_num != -ENOTDIR) {
-            return inode_num;
-       }
-    if (inode_num == -ENOENT) {
-                return -ENOENT;
-        }
-
-    if (inode_num == -ENOTDIR) {
-                return ENOTDIR;
-           }
-
+    struct fs_inode the_inode = inodes[inode_num];
+    fs_set_attrs(&the_inode, sb, inode_num);
 
     return 0;
 }
+
 
 
 /**
@@ -502,7 +505,7 @@ static int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
 	}
 
 
-	//request memory of block size
+	//request memory of block sizes
 	void *block = malloc(FS_BLOCK_SIZE);
 	//read information of the inode's d-entries block from disk into block
 	disk->ops->read(disk, inode.direct[0], 1, block);
@@ -644,11 +647,10 @@ static int fs_truncate(const char *path, off_t len)
  */
 
 
+
 static int fs_unlink(const char *path)
 {
-
-    return 0;
-
+	return 0;
 }
 
 /**
@@ -688,66 +690,6 @@ static int fs_rmdir(const char *path)
  */
 static int fs_rename(const char *src_path, const char *dst_path)
 {
-    //get the old name from src_path
-    char the_old_name[FS_FILENAME_SIZE];
-    char *tmp_path = strdupa(src_path);
-    //get_parent_inum
-    int prev_pinum = translate_1(tmp_path, the_old_name);
-
-    tmp_path = strdupa(src_path);
-    //translate_path_to_inum
-    int curr_inum = translate(tmp_path);
-
-    char the_new_name[FS_FILENAME_SIZE];
-    tmp_path = strdupa(dst_path);
-    int new_pinum = translate_1(tmp_path, the_new_name);
-
-    if (curr_inum == -ENOTDIR || curr_inum == -ENOENT) {
-        return curr_inum;
-    }
-
-    if (prev_pinum != new_pinum) {
-        return -EINVAL;
-    }
-
-    struct fs_inode parent_inode = inodes[prev_pinum];
-    void *block = malloc(FS_BLOCK_SIZE);
-    disk->ops->read(disk, parent_inode.direct[0], 1, block);
-    struct fs_dirent *entry = block;
-
-    /* to check if destination is not present */
-    int i = 0;
-    for (i = 0; i < DIRENTS_PER_BLK; i++) {
-        if (!strcmp(entry->name, the_new_name)) {
-            if (block) {
-                free(block);
-            }
-            return -EEXIST;
-        }
-        entry++;
-    }
-
-    /* update name of matching inode */
-    entry = block;
-    for (i = 0; i < DIRENTS_PER_BLK; i++) {
-        if (entry->inode == curr_inum) {
-            strncpy(entry->name, the_new_name, strlen(the_new_name));
-            struct fs_inode inode = inodes[curr_inum];
-            inode.ctime = time(NULL);
-            inodes[curr_inum] = inode;
-            write_all_inodes();
-            break;
-        }
-        entry++;
-    }
-
-    /* write back to disk */
-    disk->ops->write(disk, parent_inode.direct[0], 1, block);
-
-    /* free previously allocated memory */
-    if (block) {
-        free(block);
-    }
 
     return 0;
 
