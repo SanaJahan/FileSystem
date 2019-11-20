@@ -448,6 +448,7 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
  */
 
 /**
+ * fs_init reads the super block
  * init - this is called once by the FUSE framework at startup.
  *
  * This is a good place to read in the super-block and set up any
@@ -472,6 +473,7 @@ static void* fs_init(struct fuse_conn_info *conn)
     // read inode map
     inode_map_base = 1;
     inode_map = malloc(sb.inode_map_sz * FS_BLOCK_SIZE);
+    // read the bitmap into memory and hold it there
     if (disk->ops->read(disk, inode_map_base, sb.inode_map_sz, inode_map) < 0) {
         exit(1);
     }
@@ -486,7 +488,7 @@ static void* fs_init(struct fuse_conn_info *conn)
     /* The inode data is written to the next set of blocks */
     inode_base = block_map_base + sb.block_map_sz;
     n_inodes = sb.inode_region_sz * INODES_PER_BLK;
-    inodes = malloc(sb.inode_region_sz * FS_BLOCK_SIZE);
+    inodes = malloc(sb.inode_region_sz * FS_BLOCK_SIZE);// how many blocks allocated to inodes X no. of inodes
     if (disk->ops->read(disk, inode_base, sb.inode_region_sz, inodes) < 0) {
         exit(1);
     }
@@ -499,6 +501,10 @@ static void* fs_init(struct fuse_conn_info *conn)
 
     // allocate array of dirty metadata block pointers
     dirty = calloc(n_meta, sizeof(void*));  // ptrs to dirty metadata blks
+
+    //dirty bits : that data eventually should be wriiten out to disks.
+    //whihc means if we made a change to the blocks and changed the inode from allocated to alocated and
+    // didnt write ot the disks yet, we mark it dirty
 
     /* your code here */
 
@@ -735,6 +741,56 @@ static int fs_mkdir(const char *path, mode_t mode)
  */
 static int fs_truncate(const char *path, off_t len)
 {
+
+	/* invalid argument when len is not zero */
+    if (len != 0) {
+    	return -EINVAL;
+    }
+
+    int index;
+    char buffer[1024];
+    int inum = translate(path);
+    int inumDir = translate_1(path, buffer);
+
+    if (inum < 0) {
+        return -ENOENT;
+    } else if (S_ISDIR(inodes[inum].mode)) {
+        return -EISDIR;
+    }
+
+    struct fs_dirent *de =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
+
+    // read from the disk into the directory
+    if (disk->ops->read(disk, inodes[inumDir].direct[0], 1, de) < 0) {
+        exit(1);
+    }
+
+    // check if all the entry is valid
+    for (index = 0; index<=31; index++) {
+        if(de[index].valid && strcmp(de[index].name, buffer) == 0) {
+
+            // truncate
+            inodes[de[index].inode].size = 0;
+            // modify the modification time to null
+            inodes[de[index].inode].mtime = time(NULL);
+
+            struct fs_inode _inode = inodes[de[index].inode];
+            // return the inode to the free list
+            return_inode(_inode);
+            break;
+        }
+    }
+
+    inodes[inumDir].mtime = time(NULL);
+
+    // write to the directory
+    if (disk->ops->write(disk, inodes[inumDir].direct[0], 1, de) < 0) {
+        exit(1);
+    }
+
+    write_all_inodes();
+
+    free(de);
     return 0;
 }
 
@@ -768,7 +824,52 @@ static int fs_unlink(const char *path)
  */
 static int fs_rmdir(const char *path)
 {
-    return -EOPNOTSUPP;
+
+    char buffer[1024];
+    // get the inode of the file or directory
+    int inode = translate(path);
+    int inodeDir = translate_1(path, buffer);
+
+    if (inode < 0) {
+        return -ENOENT;
+    } else if (!S_ISDIR(inodes[inode].mode)) {
+        return -ENOTDIR;
+    } else if (!is_empty_dir(inode)) {
+        return -ENOTEMPTY;
+    }
+
+    struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
+
+    // read the disk
+    if (disk->ops->read(disk, inodes[inodeDir].direct[0], 1, dirEntry) < 0) {
+        exit(1);
+    }
+
+    for (int i = 0; i <= 31; i++) {
+    	// check if the entry is valid
+        if (dirEntry[i].valid && (strcmp(dirEntry[i].name, buffer) == 0)) {
+        	dirEntry[i].valid = 0;
+            // return the inode to the free list
+            return_inode(dirEntry[i].inode);
+            break;
+        }
+    }
+
+    // change the modification time to null
+    inodes[inodeDir].mtime = time(NULL);
+
+    // free the inode for the directory
+    FD_CLR(inodes[inode].direct[0], block_map);
+
+    // write directory
+    if (disk->ops->write(disk, inodes[inodeDir].direct[0], 1, dirEntry) < 0) {
+        exit(1);
+    }
+
+    write_all_inodes();
+
+    free(dirEntry);
+    return 0;
 }
 
 
@@ -786,7 +887,7 @@ static int fs_rmdir(const char *path)
  *   -ENOENT   - source file or directory does not exist
  *   -ENOTDIR  - component of source or target path not a directory
  *   -EEXIST   - destination already exists
- *   -EINVAL   - source and destination not in the same directory
+ *   -EINVAL   - source and destination not in thinite same directory
  *
  * @param src_path the source path
  * @param dst_path the destination path.
@@ -796,6 +897,7 @@ static int fs_rename(const char *src_path, const char *dst_path)
 {
     //get the old name from src_path
     char the_old_name[FS_FILENAME_SIZE];
+
     char *tmp_path = strdupa(src_path);
     //get_parent_inum
     int prev_pinum = translate_1(tmp_path, the_old_name);
