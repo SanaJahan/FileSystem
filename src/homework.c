@@ -748,9 +748,9 @@ static int fs_truncate(const char *path, off_t len)
     }
 
     int index;
-    char buffer[1024];
     int inum = translate(path);
-    int inumDir = translate_1(path, buffer);
+    char *dir_name = strrchr(path, '/') + 1;
+
 
     if (inum < 0) {
         return -ENOENT;
@@ -758,41 +758,87 @@ static int fs_truncate(const char *path, off_t len)
         return -EISDIR;
     }
 
-    struct fs_dirent *de =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
 
-    // read from the disk into the directory
-    if (disk->ops->read(disk, inodes[inumDir].direct[0], 1, de) < 0) {
-        exit(1);
+    struct fs_inode *inode = inodes[inum];
+
+    // clear the block of the inode
+    for (int i = 0; i < N_DIRECT; i++) {
+        if (inode->direct[i])
+            FD_CLR(inode->direct[i], block_map);
+        inode->direct[i] = 0;
     }
 
-    // check if all the entry is valid
-    for (index = 0; index<=31; index++) {
-        if(de[index].valid && strcmp(de[index].name, buffer) == 0) {
-
-            // truncate
-            inodes[de[index].inode].size = 0;
-            // modify the modification time to null
-            inodes[de[index].inode].mtime = time(NULL);
-
-            struct fs_inode _inode = inodes[de[index].inode];
-            // return the inode to the free list
-            return_inode(_inode);
-            break;
-        }
+    // clear indirect blocks if it exists
+    if (inode->indir_1) {
+        truncate_indir_1(inode->indir_1);
     }
 
-    inodes[inumDir].mtime = time(NULL);
-
-    // write to the directory
-    if (disk->ops->write(disk, inodes[inumDir].direct[0], 1, de) < 0) {
-        exit(1);
+    // clear indir 2 blocks if it exists
+    if (inode->indir_2) {
+    	truncate_indir_2(inode->indir_2);
     }
 
+    // set size
+    inode->size    = 0;
+    inode->indir_1 = 0;
+    inode->indir_2 = 0;
+
+    //write back to the device
     write_all_inodes();
 
-    free(de);
+    if (disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0)
+        exit(1);
+    if (disk->ops->write(disk,block_map_base,inode_base - block_map_base,block_map) < 0)
+        exit(1);
+
     return 0;
 }
+
+static void truncate_indir_1(int blk_num) {
+
+	int num_per_blk = BLOCK_SIZE / sizeof(uint32_t);
+
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+
+    memset(buffer, 0, BLOCK_SIZE);
+
+   // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+            FD_CLR(buffer[i], block_map);
+    }
+
+    FD_CLR(blk_num, block_map);
+}
+
+/* clear the indir2 blocks of file
+ */
+static void truncate_indir_2(int blk_num) {
+	int num_per_blk = BLOCK_SIZE / sizeof(uint32_t);
+
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+
+    memset(buffer, 0, BLOCK_SIZE);
+
+    // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+            truncate_indir_1(buffer[i]);
+    }
+
+    FD_CLR(blk_num, block_map);
+}
+
 
 /**
  * unlink - delete a file.
@@ -825,10 +871,19 @@ static int fs_unlink(const char *path)
 static int fs_rmdir(const char *path)
 {
 
+    // in case of trying to remove root dir
+    if (strcmp(path, "/") == 0)
+        return -EINVAL;
+
+
     char buffer[1024];
+
     // get the inode of the file or directory
     int inode = translate(path);
-    int inodeDir = translate_1(path, buffer);
+
+
+    char *dir_name = strrchr(path, '/') + 1;
+
 
     if (inode < 0) {
         return -ENOENT;
@@ -840,29 +895,31 @@ static int fs_rmdir(const char *path)
 
     struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
 
-    // read the disk
-    if (disk->ops->read(disk, inodes[inodeDir].direct[0], 1, dirEntry) < 0) {
+    // read the disk if its empty
+
+    if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
         exit(1);
     }
 
+    //remove the directory
     for (int i = 0; i <= 31; i++) {
     	// check if the entry is valid
-        if (dirEntry[i].valid && (strcmp(dirEntry[i].name, buffer) == 0)) {
+        if (dirEntry[i].valid && (strcmp(dirEntry[i].name, dir_name) == 0)) {
         	dirEntry[i].valid = 0;
-            // return the inode to the free list
-            return_inode(dirEntry[i].inode);
+            // mark the inode as free
+            FD_CLR(dirEntry[i].inode, inode_map);
             break;
         }
     }
 
     // change the modification time to null
-    inodes[inodeDir].mtime = time(NULL);
+    inodes[inode].mtime = time(NULL);
 
     // free the inode for the directory
     FD_CLR(inodes[inode].direct[0], block_map);
 
     // write directory
-    if (disk->ops->write(disk, inodes[inodeDir].direct[0], 1, dirEntry) < 0) {
+    if (disk->ops->write(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
         exit(1);
     }
 
