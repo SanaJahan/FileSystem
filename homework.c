@@ -760,7 +760,69 @@ static int fs_utime(const char *path, struct utimbuf *ut)
 static int fs_read(const char *path, char *buf, size_t len, off_t offset,
 		    struct fuse_file_info *fi)
 {
-    return -EOPNOTSUPP;
+    // get inode number & find instantiate inode
+    int inum = translate(path);
+    // if path not valid, return error
+    if(inum == ENOENT){
+        return ENOENT;
+    }
+    // get inode
+    struct fs_inode* my_inode = inodes + inum;
+    int my_inode_size = my_inode->size;
+    printf("File size: %d, offset: %d\n", my_inode_size, offset);
+    if(offset + len > my_inode_size){
+        return EIO;
+    }
+    
+    // find the first byte to begin reading
+    int firstByteToRead = offset;
+    // find the last byte to be read in file
+    int lastByteToRead = firstByteToRead + len;
+    printf("First byte: %d, last byte: %d\n", firstByteToRead, lastByteToRead);
+    // find starting block to read - gets the nth block in the file
+    float startBlkIndex = (floor(firstByteToRead / FS_BLOCK_SIZE));
+    // find last block to read
+    float lastBlkIndex = (floor(lastByteToRead / FS_BLOCK_SIZE));
+    printf("First block to read: %d, Last block: %d\n", (int)startBlkIndex, (int)lastBlkIndex);
+    
+    
+    // find total no. of blocks we will read
+    int numBlocksToRead = (int)(lastBlkIndex - startBlkIndex + 1);
+    printf("Total blocks to read: %d\n", numBlocksToRead);
+    
+    
+    void* myPtr = malloc(FS_BLOCK_SIZE);
+    int numBytes = 0;
+    int bytesToCopy = 0;
+    
+    for(int i=0; i<numBlocksToRead; i++){
+        
+        //off_t adjustedOffset = FS_BLOCK_SIZE % offset;
+        int entryBlockNum = get_blk(my_inode, startBlkIndex, 1);
+        printf("block to read: %d\n", entryBlockNum);
+        if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
+            exit(2);
+        }
+        if(i==0){
+            // copies bytes from myPtr to buf, excludes no. of bytes in offset
+            bytesToCopy = FS_BLOCK_SIZE-offset;
+            memcpy(buf, myPtr + offset, bytesToCopy);
+            //adjustedOffset = 0;
+        }
+        else if(i==numBlocksToRead-1){
+            bytesToCopy = len - numBytes;
+            memcpy(buf, myPtr, bytesToCopy);
+        }
+        else{
+            bytesToCopy = FS_BLOCK_SIZE;
+            memcpy(buf, myPtr, bytesToCopy);
+        }
+        numBytes = numBytes + bytesToCopy;
+        buf =  buf + bytesToCopy;
+        startBlkIndex++;
+    }
+    free(myPtr);
+    return numBytes;
 }
 
 /**
