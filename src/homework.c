@@ -507,6 +507,8 @@ static void* fs_init(struct fuse_conn_info *conn)
     // didnt write ot the disks yet, we mark it dirty
 
     /* your code here */
+    int result = fs_rmdir("dir1");
+    printf("rmdir %d", result);
 
     return NULL;
 }
