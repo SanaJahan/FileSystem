@@ -57,8 +57,14 @@ fd_set *block_map;
 /** number of first data block */
 static int     block_map_base;
 
+/** block map size*/
+static int block_map_sz;
+
 /** inode map size*/
 static int inode_map_sz;
+
+/** inode region size*/
+static int inode_reg_sz;
 
 /** number of available blocks from superblock */
 static int   n_blocks;
@@ -90,7 +96,7 @@ static void **dirty;
 static int lookup(int inum, const char *name)
 {
 	struct fs_inode *theInode = (inodes + inum);
-	printf("after TheInode");
+	printf("In lookup function...after TheInode");
 	void *start = malloc(FS_BLOCK_SIZE);
 	if (disk->ops->read(disk, theInode->direct[0], 1, start) < 0) {
 		return -EIO;
@@ -100,8 +106,8 @@ static int lookup(int inum, const char *name)
 	for (int i = 0 ; i < DIRENTS_PER_BLK; i++) {
 		struct fs_dirent* directory_entry = dir + i;
 		const char *TheName = directory_entry->name;
-		printf("the name is : %s", TheName);
-		printf("the %dth directory entry    ",  i);
+		printf("In lookup function...the name is : %s", TheName);
+		printf("In lookup function...the %dth directory entry    ",  i);
 		if (directory_entry->valid &&strcmp(name, TheName) == 0) {
 			free(start);
 			return directory_entry->inode;
@@ -127,7 +133,6 @@ static int lookup(int inum, const char *name)
  */
 static int parse(char *path, char *names[], int nnames)
 {
-
     char *token = NULL;
     //char mpath[40] = "/users/documents/test.txt/..";
     char mpath[40];
@@ -156,7 +161,7 @@ static int parse(char *path, char *names[], int nnames)
 
 
     }
-    printf("No. of tokens: %d\n", num_tokens);
+    printf("In parse function...No. of tokens: %d\n", num_tokens);
 	return num_tokens;
 }
 
@@ -172,6 +177,7 @@ static int parse(char *path, char *names[], int nnames)
 static int translate(const char *path)
 {
 	// note: make copy of path before passing to parse()
+	printf("In translate... the path to be translated is: %s\n", path);
 	char *file_path = strdup(path);
 	char *names[64] = {NULL};
 	int token_number = parse(file_path, names, 0);
@@ -182,6 +188,7 @@ static int translate(const char *path)
 	struct fs_inode temp;
 	for (int i = 0; i < token_number; i++) {
 		const char *file_name =(const char *) names[i];
+		printf("the file_name is: %s\n", file_name);
 		temp = inodes[the_inode];
 		disk->ops->read(disk, temp.direct[0], 1, block);
 		fd = block;
@@ -199,7 +206,7 @@ static int translate(const char *path)
 		}
 		if (index == DIRENTS_PER_BLK) {
 			free(block);
-			return ENOENT;
+			return -ENOENT;
 		}
 	}
 	free(block);
@@ -302,6 +309,16 @@ static void flush_inode_map(void) {
 }
 
 /**
+ * Flush all the block map to disk
+ */
+static void flush_block_map(void) {
+	disk->ops->write(disk, 1 + inode_map_sz, block_map_sz, block_map);
+}
+
+void write_all_inodes() {
+    disk->ops->write(disk, (1 + inode_map_sz + block_map_sz), inode_reg_sz, inodes);
+}
+/**
  * Gets a free block number from the free list.
  *
  * @return free block number or 0 if none available
@@ -403,7 +420,8 @@ static int find_in_dir(struct fs_dirent *de, const char *name)
 static int find_free_dir(struct fs_dirent *de)
 {
     for (int entryNum = 0; entryNum < PTRS_PER_BLK; entryNum++){
-        if ((de->valid)==0){
+        if (!de->valid){
+        	printf("In find_free_entry, find the free entry: index: %d\n", entryNum);
             return entryNum;
         }
         de++;
@@ -502,19 +520,43 @@ static void* fs_init(struct fuse_conn_info *conn)
     /* your code here */
     //inode map size
     inode_map_sz = sb.inode_map_sz;
+    block_map_sz = sb.block_map_sz;
+    inode_reg_sz = sb.inode_region_sz;
 
 
-    /*test translate*/
-    int inum_file = translate("/dir1/file.2");
-    printf("the inode number of file.2 is %d\n", inum_file);
-    /* test translate_1*/
-    char file_name[FS_FILENAME_SIZE];
-    int inum_parent = translate_1("/dir1/file.2", file_name);
-    printf("the name of the file to be create if : %s \nthe inode number of the parent directory is : %d\n"
-    		, file_name, inum_parent);
+//    /*test translate*/
+//    int inum_file = translate("/dir1/file.2");
+//    printf("the inode number of file.2 is %d\n", inum_file);
+//    /* test translate_1*/
+//    char file_name[FS_FILENAME_SIZE];
+//    int inum_parent = translate_1("/dir1/file.2", file_name);
+//    printf("the name of the file to be create if : %s \nthe inode number of the parent directory is : %d\n"
+//    		, file_name, inum_parent);
 
 
     return NULL;
+}
+
+
+/**
+ * fs_set_attrs - set attrs from inode to sb
+ *
+ * @param pointer to inode
+ * @param sb pointer to stat struct
+ *
+ */
+static void fs_set_attrs(struct fs_inode *inode, struct stat *sb, int inum) {
+	sb->st_ino = inum;
+    sb->st_blocks = (inode->size - 1) / FS_BLOCK_SIZE + 1;
+    sb->st_mode = inode->mode;
+    sb->st_size = inode->size;
+    sb->st_uid = inode->uid;
+    sb->st_gid = inode->gid;
+    //set time
+    sb->st_ctime = inode->ctime;
+    sb->st_mtime = inode->mtime;
+    sb->st_atime = sb->st_mtime;
+    sb->st_nlink = 1;
 }
 
 /* Note on path translation errors:
@@ -545,7 +587,16 @@ static void* fs_init(struct fuse_conn_info *conn)
  */
 static int fs_getattr(const char *path, struct stat *sb)
 {
-    return -EOPNOTSUPP;
+    int inode_num = translate(path); // read the inode number from the given path
+
+    if (inode_num == -ENOENT || inode_num == -ENOTDIR) {
+    	return inode_num;
+    }
+
+    struct fs_inode the_inode = inodes[inode_num];
+    fs_set_attrs(&the_inode, sb, inode_num);
+
+    return 0;
 }
 
 /**
@@ -570,7 +621,46 @@ static int fs_getattr(const char *path, struct stat *sb)
 static int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
 		       off_t offset, struct fuse_file_info *fi)
 {
-    return -EOPNOTSUPP;
+	struct stat sb;
+	int rtv = fs_getattr(path, &sb);
+	//return if there is any error from getattr
+	if(rtv == -ENOENT || rtv == -ENOTDIR) {
+		return rtv;
+	}
+
+	struct fs_inode inode = inodes[sb.st_ino];
+	//check if the inode is a directory
+	if(!S_ISDIR(inode.mode)) {
+		return -ENOTDIR;
+	}
+
+
+	//request memory of block sizes
+	void *block = malloc(FS_BLOCK_SIZE);
+	//read information of the inode's d-entries block from disk into block
+	disk->ops->read(disk, inode.direct[0], 1, block);
+	struct fs_dirent *fd = block;
+
+	int i;
+	for(i = 0; i < DIRENTS_PER_BLK; i++) {
+		if(fd->valid) {
+			//reset sb
+			memset(&sb, 0, sizeof(sb));
+			//get inode
+			inode = inodes[fd->inode];
+			//set attrs of inode to sb
+			fs_set_attrs(&inode, &sb, fd->inode);
+			//fill
+			filler(ptr, fd->name, &sb, 0);
+		}
+		fd++;
+	}
+
+	if(block) {
+		free(block);
+	}
+
+    return 0;
 }
 
 /**
@@ -632,6 +722,8 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 	_path = strdup(path);
 	int parent_inode = translate_1(_path, file_name);
 
+	printf("In mknod function...reach to the stage 0, returned from child_inode and parent_inode\n");
+
 	/*
 	 * If parent path contains a intermediate component which is not a directory
 	 * or a component of the path is not present
@@ -643,18 +735,24 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 	if (!S_ISDIR(p_inode.mode)) {
 		return ENOTDIR;
 	}
+	printf("In mknode function...reach to stage 1\n"
+			"checked parent path true..\n"
+			"parent inode number is: %d\n", parent_inode);
 
 	/*
 	 * If child file alreayd exist
 	 */
 	if (child_inode > 0) {
+		printf("In mknode function...child_file exist, child inode is: %d (checking existence)\n", child_inode);
 		return EEXIST;
 	}
+	printf("In mknode function...reach to stage 2 (checking existence)\n");
 
 	int free_inode = get_free_inode();
 	if (free_inode == -ENOSPC) {
 		return -ENOSPC;
 	}
+	printf("In mknode function...reach to stage 3 (getting free inode : %d)\n", free_inode);
 	/*
 	 * create inode in the parent directory
 	 */
@@ -662,9 +760,12 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 	if (disk->ops->read(disk, p_inode.direct[0], 1, parent_directory_block) < 0) {
 		exit(2);
 	}
+	printf("In mknode function...reach to stage 4(read parent block)\n");
 	struct fs_dirent* entry = parent_directory_block;
+	struct fs_dirent* entryStart = entry;
 	struct fs_inode new_inode = inodes[free_inode];
-	int free_entry_idx = find_free_dir(entry);
+	int free_entry_idx = find_free_dir(entryStart);
+
 	if (free_entry_idx == -ENOSPC) {
 		if (parent_directory_block) {
 			free(parent_directory_block);
@@ -675,13 +776,67 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 		}
 		return -ENOSPC;
 	}
+	printf("In mknode function...reach to stage 5(find free entry index : %d)\n", free_entry_idx);
 	//todo, create new directory entry and inode of the entry
+	entry = entry + free_entry_idx;
+	memset(entry, 0, sizeof(struct fs_dirent));
+	strncpy(entry->name, file_name, strlen(file_name));
+	entry->valid = 1;
+	entry->isDir = S_ISDIR(mode);
+	entry->inode = free_inode;
+	printf("In mknode function...reach to stage 6\n"
+			"(set the name for the dir_entry: %s, the inode_num: %d)\n", entry->name, entry->inode);
+
+	/*set the inode attributes*/
+	struct fuse_context *context = fuse_get_context();
+	time_t current_time = time(NULL);
+	new_inode.ctime = current_time;
+	new_inode.mtime = current_time;
+	//new_inode.gid =(uint16_t) getgid();
+	new_inode.gid = context->gid;
+	new_inode.uid = context->uid;
+	//new_inode.uid =(uint16_t) getuid();
+	new_inode.mode = mode;
 
 
+	for (int i = 0; i < 6; i++) {
+		new_inode.direct[i] = 0;
+	}
+	new_inode.indir_1 = 0;
+	new_inode.indir_2 = 0;
+	printf("In mknode function...reach to stage 7\n");
+	/*allocate a block to the directory if the inode is a directory*/
+	if (S_ISDIR(mode)) {
+		int free_block = get_free_blk();
+		if (free_block == -ENOSPC) {
+			return_inode(free_inode);
+			flush_inode_map();
+			free(parent_directory_block);
+			return -ENOSPC;
+		}
+		new_inode.direct[0] = free_block;
+		flush_block_map();
 
+		void *block_dir = malloc(FS_BLOCK_SIZE);
+		memset(block_dir, 0, FS_BLOCK_SIZE);
+		disk->ops->write(disk, free_block, 1, block_dir);
+		free(block_dir);
+	}
+	printf("In mknode function...reach to stage 8\n");
 
+	flush_inode_map();
+	printf("In mknode function...reach to stage 8-1\n");
 
-    return -EOPNOTSUPP;
+	inodes[free_inode] = new_inode;
+
+	write_all_inodes();
+
+	printf("In mknode function...reach to stage 9\n");
+
+	disk->ops->write(disk,p_inode.direct[0], 1, parent_directory_block);
+	printf("In mknode function...reach to stage 10\n");
+	free(parent_directory_block);
+    return 0;
 }
 
 /**
@@ -700,8 +855,9 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
  */ 
 static int fs_mkdir(const char *path, mode_t mode)
 {
-	lookup(1, "file.A");
-    return -EOPNOTSUPP;
+    mode = mode | S_IFDIR;
+    int ret = fs_mknod(path, mode, 0);
+    return ret;
 }
 
 /**
