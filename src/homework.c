@@ -853,8 +853,9 @@ static int fs_rmdir(const char *path)
 
         // read the disk if its empty
 
-        if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
+   if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
             exit(1);
+     }
 
     if (inode < 0) {
         return -ENOENT;
@@ -865,7 +866,7 @@ static int fs_rmdir(const char *path)
     }
 
 
-    }
+
 
     //remove the directory
     for (int i = 0; i <= 31; i++) {
