@@ -71,6 +71,9 @@ static int    n_meta;
 /** array of dirty metadata blocks to write */
 static void **dirty;
 
+static void write_all_inodes();
+
+
 /* Suggested functions to implement -- you are free to ignore these
  * and implement your own instead
  */
@@ -507,8 +510,8 @@ static void* fs_init(struct fuse_conn_info *conn)
     // didnt write ot the disks yet, we mark it dirty
 
     /* your code here */
-    int result = fs_rmdir("dir1");
-    printf("rmdir %d", result);
+//    int result = rmdir("dir1");
+//    printf("rmdir %d", result);
 
     return NULL;
 }
@@ -607,45 +610,6 @@ static int fs_getattr(const char *path, struct stat *sb)
 static int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
 		       off_t offset, struct fuse_file_info *fi)
 {
-	struct stat sb;
-	int rtv = fs_getattr(path, &sb);
-	//return if there is any error from getattr
-	if(rtv == -ENOENT || rtv == -ENOTDIR) {
-		return rtv;
-	}
-
-	struct fs_inode inode = inodes[sb.st_ino];
-	//check if the inode is a directory
-	if(!S_ISDIR(inode.mode)) {
-		return -ENOTDIR;
-	}
-
-
-	//request memory of block size
-	void *block = malloc(FS_BLOCK_SIZE);
-	//read information of the inode's d-entries block from disk into block
-	disk->ops->read(disk, inode.direct[0], 1, block);
-	struct fs_dirent *fd = block;
-
-	int i;
-	for(i = 0; i < DIRENTS_PER_BLK; i++) {
-		if(fd->valid) {
-			//reset sb
-			memset(&sb, 0, sizeof(sb));
-			//get inode
-			inode = inodes[fd->inode];
-			//set attrs of inode to sb
-			fs_set_attrs(&inode, &sb, fd->inode);
-			//fill
-			filler(ptr, fd->name, &sb, 0);
-		}
-		fd++;
-	}
-
-	if(block) {
-		free(block);
-	}
-
     return 0;
 
 }
@@ -741,60 +705,7 @@ static int fs_mkdir(const char *path, mode_t mode)
  * @param len the length
  * @return 0 if successful, or -error number
  */
-static int fs_truncate(const char *path, off_t len)
-{
 
-	/* invalid argument when len is not zero */
-    if (len != 0) {
-    	return -EINVAL;
-    }
-
-    int index;
-    int inum = translate(path);
-    char *dir_name = strrchr(path, '/') + 1;
-
-
-    if (inum < 0) {
-        return -ENOENT;
-    } else if (S_ISDIR(inodes[inum].mode)) {
-        return -EISDIR;
-    }
-
-
-    struct fs_inode *inode = inodes[inum];
-
-    // clear the block of the inode
-    for (int i = 0; i < N_DIRECT; i++) {
-        if (inode->direct[i])
-            FD_CLR(inode->direct[i], block_map);
-        inode->direct[i] = 0;
-    }
-
-    // clear indirect blocks if it exists
-    if (inode->indir_1) {
-        truncate_indir_1(inode->indir_1);
-    }
-
-    // clear indir 2 blocks if it exists
-    if (inode->indir_2) {
-    	truncate_indir_2(inode->indir_2);
-    }
-
-    // set size
-    inode->size    = 0;
-    inode->indir_1 = 0;
-    inode->indir_2 = 0;
-
-    //write back to the device
-    write_all_inodes();
-
-    if (disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0)
-        exit(1);
-    if (disk->ops->write(disk,block_map_base,inode_base - block_map_base,block_map) < 0)
-        exit(1);
-
-    return 0;
-}
 
 static void truncate_indir_1(int blk_num) {
 
@@ -842,6 +753,59 @@ static void truncate_indir_2(int blk_num) {
 }
 
 
+static int fs_truncate(const char *path, off_t len)
+{
+
+	/* invalid argument when len is not zero */
+    if (len != 0) {
+    	return -EINVAL;
+    }
+
+    int inum = translate(path);
+
+
+    if (inum < 0) {
+        return -ENOENT;
+    } else if (S_ISDIR(inodes[inum].mode)) {
+        return -EISDIR;
+    }
+
+
+    struct fs_inode *inode = &inodes[inum];
+
+    // clear the block of the inode
+    for (int i = 0; i < N_DIRECT; i++) {
+        if (inode->direct[i])
+            FD_CLR(inode->direct[i], block_map);
+        inode->direct[i] = 0;
+    }
+
+    // clear indirect blocks if it exists
+    if (inode->indir_1) {
+        truncate_indir_1(inode->indir_1);
+    }
+
+    // clear indir 2 blocks if it exists
+    if (inode->indir_2) {
+    	truncate_indir_2(inode->indir_2);
+    }
+
+    // set size
+    inode->size    = 0;
+    inode->indir_1 = 0;
+    inode->indir_2 = 0;
+
+    //write back to the device
+    write_all_inodes();
+
+    if (disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0)
+        exit(1);
+    if (disk->ops->write(disk,block_map_base,inode_base - block_map_base,block_map) < 0)
+        exit(1);
+
+    return 0;
+}
+
 /**
  * unlink - delete a file.
  *
@@ -878,7 +842,6 @@ static int fs_rmdir(const char *path)
         return -EINVAL;
 
 
-    char buffer[1024];
 
     // get the inode of the file or directory
     int inode = translate(path);
@@ -886,21 +849,22 @@ static int fs_rmdir(const char *path)
 
     char *dir_name = strrchr(path, '/') + 1;
 
+    struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
+
+        // read the disk if its empty
+
+        if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
+            exit(1);
 
     if (inode < 0) {
         return -ENOENT;
     } else if (!S_ISDIR(inodes[inode].mode)) {
         return -ENOTDIR;
-    } else if (!is_empty_dir(inode)) {
+    } else if (!is_empty_dir(dirEntry)) {
         return -ENOTEMPTY;
     }
 
-    struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
 
-    // read the disk if its empty
-
-    if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
-        exit(1);
     }
 
     //remove the directory
@@ -954,67 +918,6 @@ static int fs_rmdir(const char *path)
  */
 static int fs_rename(const char *src_path, const char *dst_path)
 {
-    //get the old name from src_path
-    char the_old_name[FS_FILENAME_SIZE];
-
-    char *tmp_path = strdupa(src_path);
-    //get_parent_inum
-    int prev_pinum = translate_1(tmp_path, the_old_name);
-
-    tmp_path = strdupa(src_path);
-    //translate_path_to_inum
-    int curr_inum = translate(tmp_path);
-
-    char the_new_name[FS_FILENAME_SIZE];
-    tmp_path = strdupa(dst_path);
-    int new_pinum = translate_1(tmp_path, the_new_name);
-
-    if (curr_inum == -ENOTDIR || curr_inum == -ENOENT) {
-        return curr_inum;
-    }
-
-    if (prev_pinum != new_pinum) {
-        return -EINVAL;
-    }
-
-    struct fs_inode parent_inode = inodes[prev_pinum];
-    void *block = malloc(FS_BLOCK_SIZE);
-    disk->ops->read(disk, parent_inode.direct[0], 1, block);
-    struct fs_dirent *entry = block;
-
-    /* to check if destination is not present */
-    int i = 0;
-    for (i = 0; i < DIRENTS_PER_BLK; i++) {
-        if (!strcmp(entry->name, the_new_name)) {
-            if (block) {
-                free(block);
-            }
-            return -EEXIST;
-        }
-        entry++;
-    }
-
-    /* update name of matching inode */
-    entry = block;
-    for (i = 0; i < DIRENTS_PER_BLK; i++) {
-        if (entry->inode == curr_inum) {
-            strncpy(entry->name, the_new_name, strlen(the_new_name));
-            struct fs_inode inode = inodes[curr_inum];
-            inode.ctime = time(NULL);
-            inodes[curr_inum] = inode;
-            write_all_inodes();
-            break;
-        }
-        entry++;
-    }
-
-    /* write back to disk */
-    disk->ops->write(disk, parent_inode.direct[0], 1, block);
-
-    /* free previously allocated memory */
-    if (block) {
-        free(block);
-    }
 
     return 0;
 }
