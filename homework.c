@@ -350,6 +350,84 @@ static int is_empty_dir(struct fs_dirent *de)
     return 1;
 }
 
+
+/** Helper function for getBlk which allocates the nth block if it does not exist */
+
+static void allocate_nth_block(struct fs_inode *in, int n){
+    
+    // if n < 6, allocate a free block at nth index
+    if(n < N_DIRECT){
+        int freeBlk = get_free_blk();
+        FD_SET(freeBlk, block_map);
+    }
+    
+    // n is > 6 or < 256, allocate a block in the indir1 blocks
+    else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
+        
+        uint32_t indir_block_1 = in->indir_1;
+        // if this is the very first block in the indir1 blocks, first allocate block for indir1. Then allocate data block inside indir1
+        if(n== N_DIRECT){
+            int freeBlkForIndir1 = get_free_blk();
+            indir_block_1 = freeBlkForIndir1;
+        }
+        
+        printf("Ptrs per blk: %d, indirBlk: %d\n", PTRS_PER_BLK, indir_block_1);
+        int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
+            exit(2);
+        }
+        
+        // find free block from block map
+        int freeBlkNum = get_free_blk();
+        // add free block to the nth block position
+        ptr_to_indir1[n-N_DIRECT] = freeBlkNum;
+        // set block num to allocated in blockmap
+        FD_SET(freeBlkNum, block_map); // returns nth block from indirect blocks
+        
+    }
+    // if n >= 262, allocate a free block to the indir2 blocks
+    else if(n >= (N_DIRECT + PTRS_PER_BLK)){
+        uint32_t indir_block_2 = in->indir_1;
+        // if nth block is the very first block in the indir blocks, first allocate a block for indir2
+        if(n==N_DIRECT + PTRS_PER_BLK){
+            int freeBlkForIndir2 = get_free_blk();                      // free block for in->indir2
+            indir_block_2 = freeBlkForIndir2;
+        }
+        // if this is not the very first indir2 block, perform computation to find correct location to add free block
+        int adjusted_n = n - (N_DIRECT + PTRS_PER_BLK);
+        
+        int* ptr_to_indir2 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_2, 1, ptr_to_indir2) < 0) {
+            exit(2);
+        }
+        // find the block index in indirect2 block that we will read, get ceil
+        // ceil(738 / 256) = 3.0
+        double index_from_indir2 = (ceil)(adjusted_n / PTRS_PER_BLK);
+        // convert to int = 3 for dereferencing
+        int index_from_indir2_int = (int)(index_from_indir2);
+        
+        // get free block to allocate inside indir2
+        int freeBlkInsideIndir2 = get_free_blk();                       // first free block
+        
+        // set second level block in indir2 inside which we will allocate our data block
+        ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
+        FD_SET(freeBlkInsideIndir2, block_map);
+        
+        int* myptr = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, freeBlkInsideIndir2 , 1, myptr) < 0) {
+            exit(2);
+        }
+        // find the final target location where our free data block will be allocated
+        int target_idx = adjusted_n % PTRS_PER_BLK;
+        
+        int finalindir2FreeBlk = get_free_blk();                        // second free block
+        myptr[target_idx] = finalindir2FreeBlk;
+        FD_SET(finalindir2FreeBlk, block_map);
+        
+    }
+    
+}
+
 /**
  * Returns the n-th block of the file, or allocates
  * it if it does not exist and alloc == 1.
@@ -364,17 +442,25 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
 {
     // Let's assume n=1000 for inode 7 (size = 276177 bytes)
     float file_size_bytes = (float)in->size;
-    
     // convert bytes to block size
     float file_size_blocks = (ceil)(file_size_bytes / FS_BLOCK_SIZE);
     
-    int retVal = -1;    // initialize retVal to -1 which is invalid block no
+    /** adding code to check if nth block exists */
+    // if nth block does not exist & alloc = 1, then allocate a free block to nth index
+    if(file_size_blocks < n-1 && alloc==1){
+        allocate_nth_block(in, n);
+        return 0;
+    }
+    // if nth block does not exist & alloc = 0, return error
+    else{
+        return ENOMEM;
+    }
     
+    int retVal = -1;    // initialize retVal to -1 which is invalid block no
     // if n is between 0 to 5, access the direct blocks = 6 blocks
     if(n < N_DIRECT){
         retVal = in->direct[n];
     }
-    
     // if n is between 6 to 255: access indirect1 block
     else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
         int indir_block_1 = in->indir_1;
@@ -385,27 +471,21 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
         }
         retVal = ptr_to_indir1[n-N_DIRECT]; // returns nth block from indirect blocks
     }
-    
     // else if n = 256 or greater : access the indir2 block
     else if(n >= (N_DIRECT + PTRS_PER_BLK)){
-        
         // if n = 1000, adjusted_n = 1000 - 262 = 738
         int adjusted_n = n - (N_DIRECT + PTRS_PER_BLK);
-        
         // find indirect2 block num & read the block
         int indir_block_2 = in->indir_2;
         int* ptr_to_indir2 = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, indir_block_2, 1, ptr_to_indir2) < 0) {
             exit(2);
         }
-        
         // find the block index in indirect2 block that we will read, get ceil
         // ceil(738 / 256) = 3.0
         double index_from_indir2 = (ceil)(adjusted_n / PTRS_PER_BLK);
-        
         // convert to int = 3 for dereferencing
         int index_from_indir2_int = (int)(index_from_indir2);
-        
         // get block number that we will finally read from (second level block)
         // i.e. read from the third block in indirect2
         int block_num_in_indirect = ptr_to_indir2[index_from_indir2_int];
@@ -413,7 +493,6 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
         if (disk->ops->read(disk, block_num_in_indirect , 1, myptr) < 0) {
             exit(2);
         }
-        
         // target index = 738 % 256 = 226. Hence, we read the block at index 226 from the 3rd block that we had located
         int target_idx = adjusted_n % PTRS_PER_BLK;
         
@@ -421,7 +500,6 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
         
     }
     return retVal;
-    /** Need to update this function with logic for alloc */
 }
 
 /* Fuse functions
