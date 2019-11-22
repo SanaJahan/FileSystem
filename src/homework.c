@@ -838,20 +838,16 @@ static int fs_rmdir(const char *path)
 {
 
     // in case of trying to remove root dir
-    if (strcmp(path, "/") == 0)
+        if (strcmp(path, "/") == 0)
         return -EINVAL;
 
 
+	char* _path = strdup(path);
 
-    // get the inode of the file or directory
-    int inode = translate(path);
-
-
-    char *dir_name = strrchr(path, '/') + 1;
+    // get the inode of the directory
+    int inode = translate(_path);
 
     struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
-
-        // read the disk if its empty
 
    if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
             exit(1);
@@ -868,32 +864,60 @@ static int fs_rmdir(const char *path)
 
 
 
-    //remove the directory
-    for (int i = 0; i <= 31; i++) {
-    	// check if the entry is valid
-        if (dirEntry[i].valid && (strcmp(dirEntry[i].name, dir_name) == 0)) {
-        	dirEntry[i].valid = 0;
-            // mark the inode as free
-            FD_CLR(dirEntry[i].inode, inode_map);
-            break;
-        }
-    }
 
-    // change the modification time to null
-    inodes[inode].mtime = time(NULL);
+	// clear the parent's block
+	memset(dirEntry, 0, FS_BLOCK_SIZE);
 
-    // free the inode for the directory
-    FD_CLR(inodes[inode].direct[0], block_map);
+	if (disk->ops->write(disk, inodes[inode].direct[0], 1, dirEntry) < 0){
+		exit(1);
+	}
 
-    // write directory
-    if (disk->ops->write(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
+	return_blk(inodes[inode].direct[0]);
+
+	inodes[inode].direct[0] = 0;
+	if (disk->ops->write(disk, block_map_base, 1, block_map) < 0){
+		exit(1);
+	}
+
+	char* leaf = malloc(sizeof(char*));
+	int parent_inum = translate_1(_path, leaf);
+	if(parent_inum < 0){
+		return parent_inum;
+	}
+	//get the parent inode
+	struct fs_inode* parent_node = &inodes[parent_inum];
+	if(!S_ISDIR(parent_node->mode)){
+		return -ENOTDIR;
+	}
+	//get the dirents of parent inode
+
+	struct fs_dirent* dirents = calloc(1, FS_BLOCK_SIZE);
+
+	if (disk->ops->read(disk, parent_node->direct[0], 1, dirents) < 0){
+		exit(1);
+	}
+
+	for(int i = 0; i < DIRENTS_PER_BLK; i++){
+		if(dirents[i].valid && strcmp(dirents[i].name, leaf) == 0){
+			dirents[i].valid = 0;
+			return_blk(inode);
+			break;
+		}
+	}
+
+	if (disk->ops->write(disk, parent_node->direct[0], 1, dirents) < 0){
         exit(1);
-    }
+	}
 
-    write_all_inodes();
+	if(disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0) {
+        exit(1);
+	}
 
-    free(dirEntry);
-    return 0;
+	free(dirents);
+	free(dirEntry);
+	free(leaf);
+	free(_path);
+	return 0;
 }
 
 
