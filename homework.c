@@ -358,6 +358,7 @@ static void allocate_nth_block(struct fs_inode *in, int n){
     // if n < 6, allocate a free block at nth index
     if(n < N_DIRECT){
         int freeBlk = get_free_blk();
+        in->direct[n] = freeBlk;
         FD_SET(freeBlk, block_map);
     }
     
