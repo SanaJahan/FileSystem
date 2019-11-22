@@ -353,22 +353,23 @@ static int is_empty_dir(struct fs_dirent *de)
 
 /** Helper function for getBlk which allocates the nth block if it does not exist */
 
-static void allocate_nth_block(struct fs_inode *in, int n){
+static int allocate_nth_block(struct fs_inode *in, int n){
+    
+    int ret = -1;       // initialize ret
     
     // if n < 6, allocate a free block at nth index
     if(n < N_DIRECT){
         int freeBlk = get_free_blk();
         in->direct[n] = freeBlk;
         FD_SET(freeBlk, block_map);
+        ret = freeBlk;
     }
-    
     // n is > 6 or < 256, allocate a block in the indir1 blocks
     else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
-        
-        uint32_t indir_block_1 = in->indir_1;
         // if this is the very first block in the indir1 blocks, first allocate block for indir1. Then allocate data block inside indir1
-        if(n== N_DIRECT){
-            int freeBlkForIndir1 = get_free_blk();
+        uint32_t indir_block_1 = in->indir_1;
+        if(n==N_DIRECT){
+            int freeBlkForIndir1 = get_free_blk();      // allocate block for indir1
             indir_block_1 = freeBlkForIndir1;
         }
         
@@ -379,21 +380,25 @@ static void allocate_nth_block(struct fs_inode *in, int n){
         }
         
         // find free block from block map
-        int freeBlkNum = get_free_blk();
+        int freeBlkNum = get_free_blk();                // allocate block for data
         // add free block to the nth block position
         ptr_to_indir1[n-N_DIRECT] = freeBlkNum;
         // set block num to allocated in blockmap
         FD_SET(freeBlkNum, block_map); // returns nth block from indirect blocks
+        ret = freeBlkNum;
         
     }
     // if n >= 262, allocate a free block to the indir2 blocks
     else if(n >= (N_DIRECT + PTRS_PER_BLK)){
+        
         uint32_t indir_block_2 = in->indir_1;
+        
         // if nth block is the very first block in the indir blocks, first allocate a block for indir2
         if(n==N_DIRECT + PTRS_PER_BLK){
-            int freeBlkForIndir2 = get_free_blk();                      // free block for in->indir2
+            int freeBlkForIndir2 = get_free_blk();      // allocate block for indir2
             indir_block_2 = freeBlkForIndir2;
         }
+        
         // if this is not the very first indir2 block, perform computation to find correct location to add free block
         int adjusted_n = n - (N_DIRECT + PTRS_PER_BLK);
         
@@ -408,7 +413,7 @@ static void allocate_nth_block(struct fs_inode *in, int n){
         int index_from_indir2_int = (int)(index_from_indir2);
         
         // get free block to allocate inside indir2
-        int freeBlkInsideIndir2 = get_free_blk();                       // first free block
+        int freeBlkInsideIndir2 = get_free_blk();       // first level block alloc
         
         // set second level block in indir2 inside which we will allocate our data block
         ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
@@ -421,12 +426,13 @@ static void allocate_nth_block(struct fs_inode *in, int n){
         // find the final target location where our free data block will be allocated
         int target_idx = adjusted_n % PTRS_PER_BLK;
         
-        int finalindir2FreeBlk = get_free_blk();                        // second free block
+        int finalindir2FreeBlk = get_free_blk();       // second level data block allocated
         myptr[target_idx] = finalindir2FreeBlk;
         FD_SET(finalindir2FreeBlk, block_map);
+        ret = finalindir2FreeBlk;
         
     }
-    
+    return ret;
 }
 
 /**
@@ -449,12 +455,12 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
     /** adding code to check if nth block exists */
     // if nth block does not exist & alloc = 1, then allocate a free block to nth index
     if(file_size_blocks < n-1 && alloc==1){
-        allocate_nth_block(in, n);
-        return 0;
+        int ret = allocate_nth_block(in, n);
+        return ret;
     }
     // if nth block does not exist & alloc = 0, return error
     else{
-        return ENOMEM;
+        return 0;
     }
     
     int retVal = -1;    // initialize retVal to -1 which is invalid block no
@@ -501,6 +507,7 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
         
     }
     return retVal;
+    
 }
 
 /* Fuse functions
@@ -883,6 +890,7 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
             exit(2);
         }
         if(i==0){
+            offset = offset % FS_BLOCK_SIZE;            // rounding up offset
             // copies bytes from myPtr to buf, excludes no. of bytes in offset
             bytesToCopy = FS_BLOCK_SIZE-offset;
             memcpy(buf, myPtr + offset, bytesToCopy);
