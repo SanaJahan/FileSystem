@@ -860,6 +860,52 @@ static int fs_mkdir(const char *path, mode_t mode)
     return ret;
 }
 
+
+static void truncate_indir_1(int blk_num) {
+
+	int num_per_blk = FS_BLOCK_SIZE / sizeof(uint32_t);
+
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+
+    memset(buffer, 0, FS_BLOCK_SIZE);
+
+   // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+        	return_blk(buffer[i]);
+    }
+
+    FD_CLR(blk_num, block_map);
+}
+
+/* clear the indir2 blocks of file
+ */
+static void truncate_indir_2(int blk_num) {
+	int num_per_blk = BLOCK_SIZE / sizeof(uint32_t);
+
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+
+    memset(buffer, 0, BLOCK_SIZE);
+
+    // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+            truncate_indir_1(buffer[i]);
+    }
+
+    return_blk(blk_num);
+}
+
 /**
  * truncate - truncate file to exactly 'len' bytes.
  *
@@ -878,10 +924,58 @@ static int fs_truncate(const char *path, off_t len)
     /* you can cheat by only implementing this for the case of len==0,
      * and an error otherwise.
      */
+	/* invalid argument when len is not zero */
     if (len != 0) {
-    	return -EINVAL;		/* invalid argument */
+    	return -EINVAL;
     }
-    return -EOPNOTSUPP;
+
+    int inum = translate(path);
+
+
+    if (inum < 0) {
+        return inum;  //two possible errors
+    } else if (S_ISDIR(inodes[inum].mode)) {
+        return -EISDIR;
+    }
+    printf("In truncate function... finished part 0\n");
+
+    struct fs_inode *inode = &inodes[inum];
+
+    // clear the block of the inode
+    for (int i = 0; i < N_DIRECT; i++) {
+        if (inode->direct[i])
+        	return_blk(inode->direct[i]);
+        inode->direct[i] = 0;
+    }
+    printf("In truncate function... finished part 1\n");
+
+    // clear indirect blocks if it exists
+    if (inode->indir_1) {
+        truncate_indir_1(inode->indir_1);
+    }
+    printf("In truncate function... finished part 2\n");
+
+    // clear indir 2 blocks if it exists
+    if (inode->indir_2) {
+    	truncate_indir_2(inode->indir_2);
+    }
+    printf("In truncate function... finished part 3\n");
+    // set size
+    inode->size    = 0;
+    inode->indir_1 = 0;
+    inode->indir_2 = 0;
+    printf("In truncate function... finished part 4\n");
+    //write back to the device
+    write_all_inodes();
+    flush_inode_map();
+    flush_block_map();
+    printf("In truncate function... finished part final\n");
+//    if (disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0)
+//        exit(1);
+//    if (disk->ops->write(disk,block_map_base,inode_base - block_map_base,block_map) < 0)
+//        exit(1);
+
+    return 0;
 }
 
 /**
@@ -997,7 +1091,69 @@ static int fs_utime(const char *path, struct utimbuf *ut)
 static int fs_read(const char *path, char *buf, size_t len, off_t offset,
 		    struct fuse_file_info *fi)
 {
-    return -EOPNOTSUPP;
+    // get inode number & find instantiate inode
+    int inum = translate(path);
+    // if path not valid, return error
+    if(inum == ENOENT){
+        return ENOENT;
+    }
+    // get inode
+    struct fs_inode* my_inode = inodes + inum;
+    int my_inode_size = my_inode->size;
+    printf("File size: %d, offset: %d\n", my_inode_size, offset);
+    if(offset + len > my_inode_size){
+        return EIO;
+    }
+
+    // find the first byte to begin reading
+    int firstByteToRead = offset;
+    // find the last byte to be read in file
+    int lastByteToRead = firstByteToRead + len;
+    printf("First byte: %d, last byte: %d\n", firstByteToRead, lastByteToRead);
+    // find starting block to read - gets the nth block in the file
+    float startBlkIndex = (floor(firstByteToRead / FS_BLOCK_SIZE));
+    // find last block to read
+    float lastBlkIndex = (floor(lastByteToRead / FS_BLOCK_SIZE));
+    printf("First block to read: %d, Last block: %d\n", (int)startBlkIndex, (int)lastBlkIndex);
+
+
+    // find total no. of blocks we will read
+    int numBlocksToRead = (int)(lastBlkIndex - startBlkIndex + 1);
+    printf("Total blocks to read: %d\n", numBlocksToRead);
+
+
+    void* myPtr = malloc(FS_BLOCK_SIZE);
+    int numBytes = 0;
+    int bytesToCopy = 0;
+
+    for(int i=0; i<numBlocksToRead; i++){
+
+        //off_t adjustedOffset = FS_BLOCK_SIZE % offset;
+        int entryBlockNum = get_blk(my_inode, startBlkIndex, 1);
+        printf("block to read: %d\n", entryBlockNum);
+        if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
+            exit(2);
+        }
+        if(i==0){
+            // copies bytes from myPtr to buf, excludes no. of bytes in offset
+            bytesToCopy = FS_BLOCK_SIZE-offset % FS_BLOCK_SIZE;
+            memcpy(buf, myPtr + offset, bytesToCopy);
+            //adjustedOffset = 0;
+        }
+        else if(i==numBlocksToRead-1){
+            bytesToCopy = len - numBytes;
+            memcpy(buf, myPtr, bytesToCopy);
+        }
+        else{
+            bytesToCopy = FS_BLOCK_SIZE;
+            memcpy(buf, myPtr, bytesToCopy);
+        }
+        numBytes = numBytes + bytesToCopy;
+        buf =  buf + bytesToCopy;
+        startBlkIndex++;
+    }
+    free(myPtr);
+    return numBytes;
 }
 
 /**
@@ -1025,6 +1181,7 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
 static int fs_write(const char *path, const char *buf, size_t len,
 		     off_t offset, struct fuse_file_info *fi)
 {
+
     return -EOPNOTSUPP;
 }
 
