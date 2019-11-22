@@ -9,6 +9,7 @@
 
 #define FUSE_USE_VERSION 27
 
+
 #include <stdlib.h>
 #include <stddef.h>
 #include <unistd.h>
@@ -44,6 +45,15 @@ extern struct blkdev *disk;
 /** pointer to inode bitmap to determine free inodes */
 static fd_set *inode_map;
 static int     inode_map_base;
+
+/** inode map size*/
+static int inode_map_sz;
+
+/** block map size*/
+static int block_map_sz;
+
+/** inode region size*/
+static int inode_reg_sz;
 
 /** pointer to inode blocks */
 static struct fs_inode *inodes;
@@ -86,8 +96,28 @@ static void **dirty;
  */
 static int lookup(int inum, const char *name)
 {
+	struct fs_inode *theInode = (inodes + inum);
+	printf("In lookup function...after TheInode");
+	void *start = malloc(FS_BLOCK_SIZE);
+	if (disk->ops->read(disk, theInode->direct[0], 1, start) < 0) {
+		return -EIO;
+	}
+
+	struct fs_dirent* dir = start;
+	for (int i = 0 ; i < DIRENTS_PER_BLK; i++) {
+		struct fs_dirent* directory_entry = dir + i;
+		const char *TheName = directory_entry->name;
+		printf("In lookup function...the name is : %s", TheName);
+		printf("In lookup function...the %dth directory entry    ",  i);
+		if (directory_entry->valid &&strcmp(name, TheName) == 0) {
+			free(start);
+			return directory_entry->inode;
+		}
+	}
+	free(start);
     return -EOPNOTSUPP;
 }
+
 
 /**
  * Parse path name into tokens at most nnames tokens after
@@ -105,7 +135,6 @@ static int lookup(int inum, const char *name)
  */
 static int parse(char *path, char *names[], int nnames)
 {
-
     char *token = NULL;
     //char mpath[40] = "/users/documents/test.txt/..";
     char mpath[40];
@@ -134,10 +163,9 @@ static int parse(char *path, char *names[], int nnames)
 
 
     }
-    //printf("No. of tokens: %d\n", num_tokens);
+    printf("In parse function...No. of tokens: %d\n", num_tokens);
 	return num_tokens;
 }
-
 /* Return inode number for specified file or directory.
  *
  * Errors
@@ -147,14 +175,14 @@ static int parse(char *path, char *names[], int nnames)
  * @param path the file path
  * @return inode of path node or error
  */
+
 static int translate(const char *path)
 {
 	// note: make copy of path before passing to parse()
-
+	printf("In translate... the path to be translated is: %s\n", path);
 	char *file_path = strdup(path);
 	char *names[64] = {NULL};
 	int token_number = parse(file_path, names, 0);
-
 	int the_inode = root_inode;
 	void *block;
 	block = malloc(FS_BLOCK_SIZE);
@@ -162,6 +190,7 @@ static int translate(const char *path)
 	struct fs_inode temp;
 	for (int i = 0; i < token_number; i++) {
 		const char *file_name =(const char *) names[i];
+		printf("the file_name is: %s\n", file_name);
 		temp = inodes[the_inode];
 		disk->ops->read(disk, temp.direct[0], 1, block);
 		fd = block;
@@ -179,10 +208,10 @@ static int translate(const char *path)
 		}
 		if (index == DIRENTS_PER_BLK) {
 			free(block);
-			return ENOENT;
+			return -ENOENT;
 		}
 	}
-
+	free(block);
     return the_inode;
 }
 
@@ -202,7 +231,50 @@ static int translate(const char *path)
 static int translate_1(const char *path, char *leaf)
 {
 	// note: make copy of path before passing to parse()
-    return -EOPNOTSUPP;
+	char *tokens[64] = {NULL};
+	char *_path = strdup(path);
+	int n_tokens = parse(_path, tokens, 64);
+	memset(leaf, 0, FS_FILENAME_SIZE);
+	if (n_tokens > 0){
+		strncpy(leaf, tokens[n_tokens - 1], strlen(tokens[n_tokens - 1]));
+	} else {
+		return -ENOENT; // if no tokens available
+	}
+	int index = 0;
+	struct fs_inode temp;
+	struct fs_dirent *fd;
+	char *token = tokens[index];
+	int inum = 1;
+	void *block = malloc(FS_BLOCK_SIZE);
+	while(tokens[index + 1] != NULL) {
+		temp = inodes[inum];
+		if (disk->ops->read(disk, temp.direct[0], 1, block)) {
+			exit(2);
+		}
+		fd = block;
+		int i = 0;
+		for (i = 0; i < DIRENTS_PER_BLK; i++) {
+			if (fd->valid && !strcmp(token, fd->name)) {
+				if (tokens[i + 1] != NULL && !(fd->isDir)) {
+					free(block);
+					return -ENOTDIR;
+				}
+				inum = fd->inode;
+				break;
+			}
+			fd++;
+		}
+		if (i == DIRENTS_PER_BLK) {
+			free(block);
+			return -ENOENT;
+		}
+		token = tokens[++index];
+	}
+
+	if (block) {
+		free(block);
+	}
+    return inum;
 }
 
 /**
@@ -216,6 +288,7 @@ static void mark_inode(struct fs_inode *in)
     int blk = inum / INODES_PER_BLK;
     dirty[inode_base + blk] = (void*)inodes + blk * FS_BLOCK_SIZE;
 }
+
 
 /**
  * Flush dirty metadata blocks to disk.
@@ -231,6 +304,41 @@ static void flush_metadata(void)
     }
 }
 
+
+/**
+ * Flush all the inode map to disk
+ */
+static void flush_inode_map(void) {
+	disk->ops->write(disk, 1, inode_map_sz, inode_map);
+}
+
+/**
+ * Flush all the block map to disk
+ */
+static void flush_block_map(void) {
+	disk->ops->write(disk, 1 + inode_map_sz, block_map_sz, block_map);
+}
+
+/**
+ * write_all_inodes - write all the inodes to the disk
+ *
+ */
+
+static void write_all_inodes() {
+    disk->ops->write(disk, (1 + inode_map_sz + block_map_sz), inode_reg_sz, inodes);
+}
+
+
+/**
+ * write_inode_map - write the complete inode map to disk
+ *
+ */
+
+void write_inode_map() {
+    disk->ops->write(disk, 1, inode_map_sz, inode_map);
+}
+
+
 /**
  * Gets a free block number from the free list.
  *
@@ -238,7 +346,13 @@ static void flush_metadata(void)
  */
 static int get_free_blk(void)
 {
-	return 0;
+	for (int i = n_meta; i < n_blocks; i++) {
+		if (!FD_ISSET(i, block_map)) {
+			FD_SET(i, block_map);
+			return i;
+		}
+	}
+	return -ENOSPC;
 }
 
 /**
@@ -248,8 +362,10 @@ static int get_free_blk(void)
  */
 static void return_blk(int blkno)
 {
+	if (blkno > n_meta) {
+		FD_CLR(blkno, block_map);
+	}
 }
-
 /**
  * Gets a free inode number from the free list.
  *
@@ -257,7 +373,14 @@ static void return_blk(int blkno)
  */
 static int get_free_inode(void)
 {
-	return 0;
+		for (int i = 0; i < n_inodes; i++) {
+			if (!FD_ISSET(i, inode_map)) {
+				FD_SET(i, inode_map);
+				return i;
+			}
+		}
+
+	return -ENOSPC;
 }
 
 /**
@@ -267,8 +390,10 @@ static int get_free_inode(void)
  */
 static void return_inode(int inum)
 {
+	if (inum >= 0 && inum < n_inodes) {
+		FD_CLR(inum, inode_map);
+	}
 }
-
 /**
  * Find entry number for existing directory entry.
  *
@@ -278,8 +403,15 @@ static void return_inode(int inum)
  */
 static int find_dir_entry(struct fs_dirent *de, const char *name)
 {
+    for (int entryNum = 0; entryNum < PTRS_PER_BLK; entryNum++){
+        if (strcmp(de->name, name) == 0){
+            return entryNum;
+        }
+        de++;
+    }
     return -1;
 }
+
 
 /**
  * Find inode for existing directory entry.
@@ -290,6 +422,12 @@ static int find_dir_entry(struct fs_dirent *de, const char *name)
  */
 static int find_in_dir(struct fs_dirent *de, const char *name)
 {
+    for (int i = 0; i < PTRS_PER_BLK; i++){
+        if (strcmp(de->name, name)==0){
+            return de->inode;
+        }
+        de++;
+    }
 	return 0;
 }
 
@@ -301,6 +439,13 @@ static int find_in_dir(struct fs_dirent *de, const char *name)
  */
 static int find_free_dir(struct fs_dirent *de)
 {
+    for (int entryNum = 0; entryNum < PTRS_PER_BLK; entryNum++){
+        if (!de->valid){
+        	printf("In find_free_entry, find the free entry: index: %d\n", entryNum);
+            return entryNum;
+        }
+        de++;
+    }
     return -ENOSPC;
 }
 
@@ -312,7 +457,13 @@ static int find_free_dir(struct fs_dirent *de)
  */
 static int is_empty_dir(struct fs_dirent *de)
 {
-	return 0;
+    for (int i = 0; i < PTRS_PER_BLK; i++){
+        if (de->valid==1){
+            return 0;
+        }
+        de++;
+    }
+    return 1;
 }
 
 /**
@@ -388,7 +539,9 @@ static void* fs_init(struct fuse_conn_info *conn)
 
     /* your code here */
 
-
+    inode_map_sz = sb.inode_map_sz;
+    block_map_sz = sb.block_map_sz;
+    inode_reg_sz = sb.inode_region_sz;
 
 
     return NULL;
@@ -587,8 +740,129 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
  */
 static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 {
-    return -EOPNOTSUPP;
+	char file_name[FS_FILENAME_SIZE];
+	char *_path = strdup(path);
+	int child_inode = translate(_path);
+	_path = strdup(path);
+	int parent_inode = translate_1(_path, file_name);
+
+	printf("In mknod function...reach to the stage 0, returned from child_inode and parent_inode\n");
+
+	/*
+	 * If parent path contains a intermediate component which is not a directory
+	 * or a component of the path is not present
+	 */
+	if(parent_inode == -ENOTDIR || parent_inode == -ENOENT) {
+		return parent_inode;
+	}
+	struct fs_inode p_inode = inodes[parent_inode];
+	if (!S_ISDIR(p_inode.mode)) {
+		return ENOTDIR;
+	}
+	printf("In mknode function...reach to stage 1\n"
+			"checked parent path true..\n"
+			"parent inode number is: %d\n", parent_inode);
+
+	/*
+	 * If child file alreayd exist
+	 */
+	if (child_inode > 0) {
+		printf("In mknode function...child_file exist, child inode is: %d (checking existence)\n", child_inode);
+		return EEXIST;
+	}
+	printf("In mknode function...reach to stage 2 (checking existence)\n");
+
+	int free_inode = get_free_inode();
+	if (free_inode == -ENOSPC) {
+		return -ENOSPC;
+	}
+	printf("In mknode function...reach to stage 3 (getting free inode : %d)\n", free_inode);
+	/*
+	 * create inode in the parent directory
+	 */
+	void *parent_directory_block = malloc(FS_BLOCK_SIZE);
+	if (disk->ops->read(disk, p_inode.direct[0], 1, parent_directory_block) < 0) {
+		exit(2);
+	}
+	printf("In mknode function...reach to stage 4(read parent block)\n");
+	struct fs_dirent* entry = parent_directory_block;
+	struct fs_dirent* entryStart = entry;
+	struct fs_inode new_inode = inodes[free_inode];
+	int free_entry_idx = find_free_dir(entryStart);
+
+	if (free_entry_idx == -ENOSPC) {
+		if (parent_directory_block) {
+			free(parent_directory_block);
+		}
+		if (FD_ISSET(free_inode, inode_map)) {
+			FD_CLR(free_inode, inode_map);
+			flush_inode_map();
+		}
+		return -ENOSPC;
+	}
+	printf("In mknode function...reach to stage 5(find free entry index : %d)\n", free_entry_idx);
+	//todo, create new directory entry and inode of the entry
+	entry = entry + free_entry_idx;
+	memset(entry, 0, sizeof(struct fs_dirent));
+	strncpy(entry->name, file_name, strlen(file_name));
+	entry->valid = 1;
+	entry->isDir = S_ISDIR(mode);
+	entry->inode = free_inode;
+	printf("In mknode function...reach to stage 6\n"
+			"(set the name for the dir_entry: %s, the inode_num: %d)\n", entry->name, entry->inode);
+
+	/*set the inode attributes*/
+	struct fuse_context *context = fuse_get_context();
+	time_t current_time = time(NULL);
+	new_inode.ctime = current_time;
+	new_inode.mtime = current_time;
+	//new_inode.gid =(uint16_t) getgid();
+	new_inode.gid = context->gid;
+	new_inode.uid = context->uid;
+	//new_inode.uid =(uint16_t) getuid();
+	new_inode.mode = mode;
+
+
+	for (int i = 0; i < 6; i++) {
+		new_inode.direct[i] = 0;
+	}
+	new_inode.indir_1 = 0;
+	new_inode.indir_2 = 0;
+	printf("In mknode function...reach to stage 7\n");
+	/*allocate a block to the directory if the inode is a directory*/
+	if (S_ISDIR(mode)) {
+		int free_block = get_free_blk();
+		if (free_block == -ENOSPC) {
+			return_inode(free_inode);
+			flush_inode_map();
+			free(parent_directory_block);
+			return -ENOSPC;
+		}
+		new_inode.direct[0] = free_block;
+		flush_block_map();
+
+		void *block_dir = malloc(FS_BLOCK_SIZE);
+		memset(block_dir, 0, FS_BLOCK_SIZE);
+		disk->ops->write(disk, free_block, 1, block_dir);
+		free(block_dir);
+	}
+	printf("In mknode function...reach to stage 8\n");
+
+	flush_inode_map();
+	printf("In mknode function...reach to stage 8-1\n");
+
+	inodes[free_inode] = new_inode;
+
+	write_all_inodes();
+
+	printf("In mknode function...reach to stage 9\n");
+
+	disk->ops->write(disk,p_inode.direct[0], 1, parent_directory_block);
+	printf("In mknode function...reach to stage 10\n");
+	free(parent_directory_block);
+    return 0;
 }
+
 
 /**
  *  mkdir - create a directory with the given mode. Behavior
@@ -606,8 +880,60 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
  */ 
 static int fs_mkdir(const char *path, mode_t mode)
 {
-    return -EOPNOTSUPP;
+    mode = mode | S_IFDIR;
+    int ret = fs_mknod(path, mode, 0);
+    return ret;
 }
+
+/**
+ * truncate helpers
+ *
+ */
+static void truncate_indir_1(int blk_num) {
+
+	int num_per_blk = FS_BLOCK_SIZE / sizeof(uint32_t);
+
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+
+    memset(buffer, 0, FS_BLOCK_SIZE);
+
+   // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+        	return_blk(buffer[i]);
+    }
+
+    FD_CLR(blk_num, block_map);
+}
+
+/* clear the indir2 blocks of file
+ */
+static void truncate_indir_2(int blk_num) {
+	int num_per_blk = BLOCK_SIZE / sizeof(uint32_t);
+
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+
+    memset(buffer, 0, BLOCK_SIZE);
+
+    // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+            truncate_indir_1(buffer[i]);
+    }
+
+    return_blk(blk_num);
+}
+
 
 /**
  * truncate - truncate file to exactly 'len' bytes.
@@ -627,10 +953,80 @@ static int fs_truncate(const char *path, off_t len)
     /* you can cheat by only implementing this for the case of len==0,
      * and an error otherwise.
      */
+	/* invalid argument when len is not zero */
     if (len != 0) {
-    	return -EINVAL;		/* invalid argument */
+    	return -EINVAL;
     }
-    return -EOPNOTSUPP;
+
+    int inum = translate(path);
+
+
+    if (inum < 0) {
+        return inum;  //two possible errors
+    } else if (S_ISDIR(inodes[inum].mode)) {
+        return -EISDIR;
+    }
+    printf("In truncate function... finished part 0\n");
+
+    struct fs_inode *inode = &inodes[inum];
+
+    // clear the block of the inode
+    for (int i = 0; i < N_DIRECT; i++) {
+        if (inode->direct[i])
+        	return_blk(inode->direct[i]);
+        inode->direct[i] = 0;
+    }
+    printf("In truncate function... finished part 1\n");
+
+    // clear indirect blocks if it exists
+    if (inode->indir_1) {
+        truncate_indir_1(inode->indir_1);
+    }
+    printf("In truncate function... finished part 2\n");
+
+    // clear indir 2 blocks if it exists
+    if (inode->indir_2) {
+    	truncate_indir_2(inode->indir_2);
+    }
+    printf("In truncate function... finished part 3\n");
+    // set size
+    inode->size    = 0;
+    inode->indir_1 = 0;
+    inode->indir_2 = 0;
+    printf("In truncate function... finished part 4\n");
+    //write back to the device
+    write_all_inodes();
+    flush_inode_map();
+    flush_block_map();
+    printf("In truncate function... finished part final\n");
+//    if (disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0)
+//        exit(1);
+//    if (disk->ops->write(disk,block_map_base,inode_base - block_map_base,block_map) < 0)
+//        exit(1);
+
+    return 0;
+}
+
+
+
+/**
+ * get_leaf - get the leaf name
+ *
+ */
+
+char *get_leaf(char *path) {
+
+    char *token = NULL;
+    char *tokens[64] = {NULL};
+    int i = 0;
+    //tokenize the string
+    token = strtok(path, "/");
+    while (token) {
+        tokens[i++] = token;
+        token = strtok(NULL, "/");
+    }
+
+    return tokens[--i];
 }
 
 /**
@@ -646,10 +1042,64 @@ static int fs_truncate(const char *path, off_t len)
  */
 
 
-
 static int fs_unlink(const char *path)
 {
-	return 0;
+    int i = 0;
+    int inum = fs_truncate(path, 0);
+    if (inum < 0)
+        return inum;
+
+    char dir_name[FS_FILENAME_SIZE];
+    char *Apath = path;
+    int parent_inum = translate_1(Apath, dir_name);
+    Apath = path;
+    char *last = dir_name;
+
+    last = get_leaf(Apath);
+
+
+    struct fs_inode parent_dir = inodes[parent_inum];
+    struct fs_dirent *block = (struct fs_dirent *) malloc(FS_BLOCK_SIZE);
+    disk->ops->read(disk, parent_dir.direct[0], 1, block);
+
+
+    // find the inode entry and clear it
+    for (i = 0; i < 32; i++) {
+
+        if (block[i].valid == 0) {
+            continue;
+        }
+
+        if (strcmp(block[i].name, last) == 0) {
+        	//delete it
+            if (block[i].isDir) {
+                return -EISDIR;
+            }
+            int file_inode_num = block[i].inode;
+            struct fs_inode fileinode = inodes[file_inode_num];
+            if (FD_ISSET(file_inode_num, inode_map)) {
+                //clear the inode
+            	FD_CLR(file_inode_num, inode_map);
+                fileinode.size = 0;
+                fileinode.mtime = time(NULL);
+                block[i].valid = 0;
+                inodes[file_inode_num] = fileinode;
+                break;
+            }
+        }
+    }
+
+
+    if (i > 31) {
+        return -ENOENT;
+    }
+    //write everything back to disk(inode map and inodes)
+    disk->ops->write(disk, parent_dir.direct[0], 1, block);
+    write_all_inodes();
+    write_inode_map();
+    free(block);
+
+    return 0;
 }
 
 /**
@@ -690,7 +1140,69 @@ static int fs_rmdir(const char *path)
 static int fs_rename(const char *src_path, const char *dst_path)
 {
 
+    //get the old name from src_path
+    char old_name[FS_FILENAME_SIZE];
+    char *tmp_path = strdup(src_path);
+    int prev_pinum = translate_1(tmp_path, old_name);
+    //rewind
+    tmp_path = strdup(src_path);
+    int curr_inum = translate(tmp_path);
+
+    //get the new name
+    char new_name[FS_FILENAME_SIZE];
+    tmp_path = strdup(dst_path);
+
+    int new_pinum = translate_1(tmp_path, new_name);
+
+    if (curr_inum == -ENOTDIR || curr_inum == -ENOENT) {
+        return curr_inum;
+    }
+
+    if (prev_pinum != new_pinum) {
+        return -EINVAL;
+    }
+
+    struct fs_inode parent_inode = inodes[prev_pinum];
+    void *block = malloc(FS_BLOCK_SIZE);
+    disk->ops->read(disk, parent_inode.direct[0], 1, block);
+    struct fs_dirent *entry = block;
+
+    //check if dst is not present
+    int i = 0;
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        if (!strcmp(entry->name, new_name)) {
+            if (block) {
+                free(block);
+            }
+            return -EEXIST;
+        }
+        entry++;
+    }
+
+    //update name of matching inode
+    entry = block;
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        if (entry->inode == curr_inum) {
+            strncpy(entry->name, new_name, strlen(new_name));
+            struct fs_inode inode = inodes[curr_inum];
+            inode.ctime = time(NULL);
+            inodes[curr_inum] = inode;
+            write_all_inodes();
+            break;
+        }
+        entry++;
+    }
+
+    //write back to disk
+    disk->ops->write(disk, parent_inode.direct[0], 1, block);
+
+    //free allocated memory
+    if (block) {
+        free(block);
+    }
+
     return 0;
+
 
 }
 
@@ -706,13 +1218,6 @@ static int fs_rename(const char *src_path, const char *dst_path)
  *   for description
  * @return 0 if successful, or -error number
  */
-
-
-//write all the inode to the disk
-static void write_all_inodes() {
-	struct fs_super sb;
-    disk->ops->write(disk, (1 + sb.inode_map_sz + sb.block_map_sz), sb.inode_region_sz, inodes);
-}
 
 static int fs_chmod(const char *path, mode_t mode)
 {
@@ -741,6 +1246,8 @@ static int fs_chmod(const char *path, mode_t mode)
     write_all_inodes();
     return 0;
 }
+
+
 
 /**
  * utime - change access and modification times.
