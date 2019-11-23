@@ -331,7 +331,7 @@ static int get_free_blk(void)
 			return i;
 		}
 	}
-	return -ENOSPC;
+	return 0;
 }
 
 /**
@@ -360,7 +360,7 @@ static int get_free_inode(void)
 			}
 		}
 
-	return -ENOSPC;
+	return 0;
 }
 
 /**
@@ -749,7 +749,7 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 	printf("In mknode function...reach to stage 2 (checking existence)\n");
 
 	int free_inode = get_free_inode();
-	if (free_inode == -ENOSPC) {
+	if (free_inode == 0) {
 		return -ENOSPC;
 	}
 	printf("In mknode function...reach to stage 3 (getting free inode : %d)\n", free_inode);
@@ -808,7 +808,7 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 	/*allocate a block to the directory if the inode is a directory*/
 	if (S_ISDIR(mode)) {
 		int free_block = get_free_blk();
-		if (free_block == -ENOSPC) {
+		if (free_block == 0) {
 			return_inode(free_inode);
 			flush_inode_map();
 			free(parent_directory_block);
@@ -1008,7 +1008,8 @@ static int fs_unlink(const char *path)
  */
 static int fs_rmdir(const char *path)
 {
-    return -EOPNOTSUPP;
+
+	    return 0;
 }
 
 /**
@@ -1066,6 +1067,8 @@ static int fs_utime(const char *path, struct utimbuf *ut)
 {
     return -EOPNOTSUPP;
 }
+
+
 
 /**
  * read - read data from an open file.
@@ -1129,14 +1132,15 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
     for(int i=0; i<numBlocksToRead; i++){
 
         //off_t adjustedOffset = FS_BLOCK_SIZE % offset;
-        int entryBlockNum = get_blk(my_inode, startBlkIndex, 1);
+        int entryBlockNum = get_blk(my_inode, startBlkIndex, 0);
         printf("block to read: %d\n", entryBlockNum);
         if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
             exit(2);
         }
         if(i==0){
+            offset = offset % FS_BLOCK_SIZE;            // rounding up offset
             // copies bytes from myPtr to buf, excludes no. of bytes in offset
-            bytesToCopy = FS_BLOCK_SIZE-offset % FS_BLOCK_SIZE;
+            bytesToCopy = FS_BLOCK_SIZE-offset;
             memcpy(buf, myPtr + offset, bytesToCopy);
             //adjustedOffset = 0;
         }
@@ -1181,8 +1185,88 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
 static int fs_write(const char *path, const char *buf, size_t len,
 		     off_t offset, struct fuse_file_info *fi)
 {
+	// get inode number & find instantiate inode
+	int inum = translate(path);
+	// if path not valid, return error
+	if(inum == -ENOENT){
+		return -ENOENT;
+	}
+	// get inode
+	struct fs_inode* my_inode = inodes + inum;
+	int my_inode_size = my_inode->size;
+	printf("File size: %d, offset: %d\n", my_inode_size, offset);
+	if(offset >= my_inode_size){
+		return -EINVAL;
+	}
 
-    return -EOPNOTSUPP;
+	// find the first byte to begin reading
+	int firstByteToRead = offset;
+	// find the last byte to be read in file
+	int lastByteToRead = firstByteToRead + len;
+	printf("First byte: %d, last byte: %d\n", firstByteToRead, lastByteToRead);
+	// find starting block to read - gets the nth block in the file
+	float startBlkIndex = (floor(firstByteToRead / FS_BLOCK_SIZE));
+	// find last block to read
+	float lastBlkIndex = (floor(lastByteToRead / FS_BLOCK_SIZE));
+	printf("First block to read: %d, Last block: %d\n", (int)startBlkIndex, (int)lastBlkIndex);
+
+    // find total no. of blocks we will read
+    int numBlocksToWrite = (int)(lastBlkIndex - startBlkIndex + 1);
+    printf("Total blocks to read: %d\n", numBlocksToWrite);
+
+    void* myPtr = malloc(FS_BLOCK_SIZE);
+    int bytesToWrite = 0;
+    int length = len;
+
+    for (int i = 0; i < numBlocksToWrite; i++){
+    	//off_t adjustedOffset = FS_BLOCK_SIZE % offset;
+		int entryBlockNum = get_blk(my_inode, startBlkIndex, 0);
+		if (entryBlockNum == 0) {
+			free(myPtr);
+			return len - length;
+		}
+
+		printf("block to write: %d\n", entryBlockNum);
+		if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
+			exit(2);
+		}
+		if (i == 0) {
+			bytesToWrite = FS_BLOCK_SIZE - offset % FS_BLOCK_SIZE;
+			if (length < bytesToWrite) {
+				bytesToWrite = length;
+				length = 0;
+			} else {
+				length -= bytesToWrite;
+			}
+			char *start = myPtr + offset % FS_BLOCK_SIZE;
+			memcpy(start, buf, bytesToWrite);
+		} else if(i==numBlocksToWrite-1){
+            bytesToWrite = len - length;
+            length -= bytesToWrite;
+            char *start = myPtr;
+            memcpy(start, buf, bytesToWrite);
+        } else {
+        	char *start = myPtr;
+        	bytesToWrite = FS_BLOCK_SIZE;
+        	length -= bytesToWrite;
+        	memcpy(start, buf, bytesToWrite);
+        }
+		buf += bytesToWrite;
+		my_inode->size += bytesToWrite;
+		inodes[inum] = my_inode;
+		write_all_inodes();
+		disk->ops->write(disk, entryBlockNum, 1, myPtr);
+		if (length == 0) break;
+		startBlkIndex++;
+    }
+
+
+
+    struct utimbuf ut;
+    ut.modtime = time(NULL);
+    fs_utime(path, &ut);
+    free(myPtr);
+    return len - length;
 }
 
 /**
