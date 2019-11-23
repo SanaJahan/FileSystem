@@ -850,7 +850,7 @@ static int fs_rmdir(const char *path)
     struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
 
    if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
-            exit(1);
+            exit(2);
      }
 
     if (inode < 0) {
@@ -894,7 +894,7 @@ static int fs_rmdir(const char *path)
 	struct fs_dirent* dirents = calloc(1, FS_BLOCK_SIZE);
 
 	if (disk->ops->read(disk, parent_node->direct[0], 1, dirents) < 0){
-		exit(1);
+		exit(2);
 	}
 
 	for(int i = 0; i < DIRENTS_PER_BLK; i++){
