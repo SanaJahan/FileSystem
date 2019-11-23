@@ -315,7 +315,7 @@ static void flush_block_map(void) {
 	disk->ops->write(disk, 1 + inode_map_sz, block_map_sz, block_map);
 }
 
-void write_all_inodes() {
+static void write_all_inodes() {
     disk->ops->write(disk, (1 + inode_map_sz + block_map_sz), inode_reg_sz, inodes);
 }
 /**
@@ -446,6 +446,122 @@ static int is_empty_dir(struct fs_dirent *de)
     return 1;
 }
 
+
+/** Helper function for getBlk which allocates the nth block if it does not exist */
+
+static int allocate_nth_block(struct fs_inode *in, int n){
+
+    int ret = -1;       // initialize ret
+
+    // if n < 6, allocate a free block at nth index
+    if(n < N_DIRECT){
+        int freeBlk = get_free_blk();
+        if(freeBlk==0){
+            return -ENOSPC;
+        }
+        in->direct[n] = freeBlk;
+        write_all_inodes();
+        ret = freeBlk;
+    }
+
+    // n is > 6 or < 262, allocate a block in the indir1 blocks
+    else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
+
+        // if this is the very first block in the indir1 blocks, first allocate block for indir1. Then allocate data block inside indir1
+        uint32_t indir_block_1 = in->indir_1;
+
+        if (n == N_DIRECT) {            // when this is the very first indir block
+            int freeBlkForIndir1 = get_free_blk();
+            if(freeBlkForIndir1==0){
+                return 0;
+            }
+            indir_block_1 = freeBlkForIndir1;
+            in->indir_1 = indir_block_1;         // allocate block for indir1
+            write_all_inodes();
+        }
+
+        int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
+            exit(2);
+        }
+
+        // find free block from block map
+        int freeBlkNum = get_free_blk();            // allocate block for data in indir1
+        if (freeBlkNum == 0) {
+            return 0;
+        }
+        // add free block to the nth block position
+        ptr_to_indir1[n-N_DIRECT] = freeBlkNum;
+        disk->ops->write(disk, indir_block_1, 1, ptr_to_indir1);
+        ret = freeBlkNum; // returns nth block from indirect blocks
+        free(ptr_to_indir1);
+
+    }
+
+    // if n >= 262, allocate a free block to the indir2 blocks
+    else if (n >= (N_DIRECT + PTRS_PER_BLK)) {
+
+        uint32_t indir_block_2 = in->indir_2;
+
+        // if nth block is the very first block in the indir2 blocks, first allocate a block for indir2
+        if( n == N_DIRECT + PTRS_PER_BLK) {
+            int freeBlkForIndir2 = get_free_blk();      // allocate block for indir2
+            if (freeBlkForIndir2 == 0) {
+                return 0;
+            }
+            indir_block_2 = freeBlkForIndir2;
+            in->indir_2 = freeBlkForIndir2;   // update in inode
+            write_all_inodes();
+        }
+
+        // if this is not the very first indir2 block, perform computation to find correct location to add free block
+        int adjusted_n = n - (N_DIRECT + PTRS_PER_BLK);
+
+        int* ptr_to_indir2 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_2, 1, ptr_to_indir2) < 0) {
+            exit(2);
+        }
+
+        // find index at which we will allocate a block inside indir2 block
+        double index_from_indir2 = ceil(adjusted_n / PTRS_PER_BLK);
+        // convert to int = 3 for dereferencing
+        int index_from_indir2_int = (int)(index_from_indir2);
+
+        int freeBlkInsideIndir2 = 0;
+        if ( adjusted_n % PTRS_PER_BLK == 0) {
+            // get free block to allocate inside indir2
+            freeBlkInsideIndir2 = get_free_blk();       // first level block alloc
+            if (freeBlkInsideIndir2 == 0) {
+            	free(ptr_to_indir2);
+                return 0;
+            } else {
+                ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
+                disk->ops->write(disk,indir_block_2 , 1, ptr_to_indir2);
+            }
+        } else {
+        	freeBlkInsideIndir2 = ptr_to_indir2[index_from_indir2_int];
+        }
+
+        int* myptr = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, freeBlkInsideIndir2 , 1, myptr) < 0) {
+            exit(2);
+        }
+        // find the final target location where our free data block will be allocated
+        int target_idx = adjusted_n % PTRS_PER_BLK;
+
+        int finalindir2FreeBlk = get_free_blk();       // second level data block allocated
+        if(finalindir2FreeBlk == 0) {
+            return -ENOSPC;
+        }
+        myptr[target_idx] = finalindir2FreeBlk;
+        disk->ops->write(disk, freeBlkInsideIndir2, 1,myptr);
+        free(myptr);
+        free(ptr_to_indir2);
+        ret = finalindir2FreeBlk;
+    }
+    return ret;
+}
+
 /**
  * Returns the n-th block of the file, or allocates
  * it if it does not exist and alloc == 1.
@@ -458,7 +574,66 @@ static int is_empty_dir(struct fs_dirent *de)
  */
 static int get_blk(struct fs_inode *in, int n, int alloc)
 {
-	return 0;
+    // Let's assume n=1000 for inode 7 (size = 276177 bytes)
+    float file_size_bytes = (float)in->size;
+    // convert bytes to block size
+    float file_size_blocks = ceil(file_size_bytes / FS_BLOCK_SIZE);
+
+    /** adding code to check if nth block exists */
+    // if nth block does not exist & alloc = 1, then allocate a free block to nth index
+    if (file_size_blocks - 1 < n && alloc == 1) {
+        int ret = allocate_nth_block(in, n);
+        return ret;
+    }
+    // if nth block does not exist & alloc = 0, return error
+    else {
+        return 0;
+    }
+
+    int retVal = -1;    // initialize retVal to -1 which is invalid block no
+    // if n is between 0 to 5, access the direct blocks = 6 blocks
+    if (n < N_DIRECT) {
+        retVal = in->direct[n];
+    }
+    // if n is between 6 to 255: access indirect1 block
+    else if (n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK) {
+        int indir_block_1 = in->indir_1;
+        printf("Ptrs per blk: %d, indirBlk: %d\n", PTRS_PER_BLK, indir_block_1);
+        int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
+            exit(2);
+        }
+        retVal = ptr_to_indir1[n-N_DIRECT]; // returns nth block from indirect blocks
+    }
+    // else if n = 256 or greater : access the indir2 block
+    else if (n >= (N_DIRECT + PTRS_PER_BLK)) {
+        // if n = 1000, adjusted_n = 1000 - 262 = 738
+        int adjusted_n = n - (N_DIRECT + PTRS_PER_BLK);
+        // find indirect2 block num & read the block
+        int indir_block_2 = in->indir_2;
+        int* ptr_to_indir2 = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, indir_block_2, 1, ptr_to_indir2) < 0) {
+            exit(2);
+        }
+        // find the block index in indirect2 block that we will read, get ceil
+        // ceil(738 / 256) = 3.0
+        double index_from_indir2 = ceil(adjusted_n / PTRS_PER_BLK);
+        // convert to int = 3 for dereferencing
+        int index_from_indir2_int = (int)(index_from_indir2);
+        // get block number that we will finally read from (second level block)
+        // i.e. read from the third block in indirect2
+        int block_num_in_indirect = ptr_to_indir2[index_from_indir2_int];
+        int* myptr = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, block_num_in_indirect , 1, myptr) < 0) {
+            exit(2);
+        }
+        // target index = 738 % 256 = 226. Hence, we read the block at index 226 from the 3rd block that we had located
+        int target_idx = adjusted_n % PTRS_PER_BLK;
+
+        retVal = myptr[target_idx];
+
+    }
+    return retVal;
 }
 
 /* Fuse functions
@@ -536,6 +711,7 @@ static void* fs_init(struct fuse_conn_info *conn)
 
     return NULL;
 }
+
 
 
 /**
@@ -1009,7 +1185,83 @@ static int fs_unlink(const char *path)
 static int fs_rmdir(const char *path)
 {
 
-	    return 0;
+    // in case of trying to remove root dir
+        if (strcmp(path, "/") == 0)
+        return -EINVAL;
+
+
+	char* _path = strdup(path);
+
+    // get the inode of the directory
+    int inode = translate(_path);
+
+    struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
+
+   if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
+            exit(1);
+     }
+
+    if (inode < 0) {
+        return -ENOENT;
+    } else if (!S_ISDIR(inodes[inode].mode)) {
+        return -ENOTDIR;
+    } else if (!is_empty_dir(dirEntry)) {
+        return -ENOTEMPTY;
+    }
+
+	// clear the parent's block
+	memset(dirEntry, 0, FS_BLOCK_SIZE);
+
+	if (disk->ops->write(disk, inodes[inode].direct[0], 1, dirEntry) < 0){
+		exit(1);
+	}
+
+	return_blk(inodes[inode].direct[0]);
+
+	inodes[inode].direct[0] = 0;
+	if (disk->ops->write(disk, block_map_base, 1, block_map) < 0){
+		exit(1);
+	}
+
+	char* leaf = malloc(sizeof(char*));
+	int parent_inum = translate_1(_path, leaf);
+	if(parent_inum < 0){
+		return parent_inum;
+	}
+	//get the parent inode
+	struct fs_inode* parent_node = &inodes[parent_inum];
+	if(!S_ISDIR(parent_node->mode)){
+		return -ENOTDIR;
+	}
+	//get the dirents of parent inode
+
+	struct fs_dirent* dirents = calloc(1, FS_BLOCK_SIZE);
+
+	if (disk->ops->read(disk, parent_node->direct[0], 1, dirents) < 0){
+		exit(1);
+	}
+
+	for(int i = 0; i < DIRENTS_PER_BLK; i++){
+		if(dirents[i].valid && strcmp(dirents[i].name, leaf) == 0){
+			dirents[i].valid = 0;
+			return_blk(inode);
+			break;
+		}
+	}
+
+	if (disk->ops->write(disk, parent_node->direct[0], 1, dirents) < 0){
+        exit(1);
+	}
+
+	if(disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0) {
+        exit(1);
+	}
+
+	free(dirents);
+	free(dirEntry);
+	free(leaf);
+	free(_path);
+	return 0;
 }
 
 /**
