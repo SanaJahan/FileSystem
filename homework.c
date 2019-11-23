@@ -58,6 +58,15 @@ fd_set *block_map;
 /** number of first data block */
 static int     block_map_base;
 
+/** block map size*/
+static int block_map_sz;
+
+/** inode map size*/
+static int inode_map_sz;
+
+/** inode region size*/
+static int inode_reg_sz;
+
 /** number of available blocks from superblock */
 static int   n_blocks;
 
@@ -99,7 +108,6 @@ static int lookup(int inum, const char *name)
     void* ptr = malloc(num_blocks * FS_BLOCK_SIZE);
     if(disk->ops->read(disk, starting_block, num_blocks, ptr) < 0){
         return EIO;
-        exit(2);
     }
     struct fs_dirent* dp = ptr;     // set dp to ptr (pointer type fs_dirent*)
     // iterate through all entries in the directory to find a match
@@ -174,10 +182,86 @@ static int parse(char *path, char *names[], int nnames)
  */
 static int translate(const char *path)
 {
+	// note: make copy of path before passing to parse()
+    char mypath[40];
+    strcpy(mypath, path);
+    char* names[20];
+    int num_tokens = parse(mypath, names, 20);
+    for(int i=0; i<num_tokens; i++){
+        printf("child: %s\n", names[i]);
+    }
+    
+    // getting all the child directories of the root node as all paths will start with root node
+    struct fs_inode* prevInode = inodes + root_inode;
+    int prevBlockNum = prevInode->direct[0];
+    
+    int k = 0; int retVal = 0;
+    int found = 0;
+    while(names[k]!=NULL && k < num_tokens) {
+        found = 0;      // reset found to 0 as we search for next component
+        printf("Handling token:%s\n",names[k]);
+        void *myptr = malloc(FS_BLOCK_SIZE);
+        if (disk->ops->read(disk, prevBlockNum, 1, myptr) < 0) {
+            exit(2);
+        }
+        struct fs_dirent *dp = myptr;
+
+        for(int j=0; j<32; j++) {
+            
+            //printf("token name: %s, entry name: %s\n", names[k], dp->name);
+            if(strcmp(names[k], dp->name)==0){
+                printf("token name: %s, entry name2: %s j:%d valid:%d\n", names[k], dp->name, j, dp->valid);
+                if(dp->valid){
+                    
+                    if (dp->isDir) {
+                        prevInode = inodes + dp->inode;
+                        prevBlockNum = prevInode->direct[0];
+                        found = 1;
+                        break;
+                    }
+                    //This is a file
+                    else {
+                        if(k == (num_tokens-1)){
+                            printf("k: %d, numToken: %d\n", k, num_tokens);
+                            retVal = dp->inode;
+                            found = 1;
+                            printf("Filename: %s, inode: %d\n", dp->name, retVal);
+                            free(myptr);
+                            return retVal;
+                        } else {
+                            free(myptr);
+                            return -ENOTDIR;    //intermediate component is not a dir
+                        }
+                    }
+                }
+            }
+            dp++;
+        }
+        free(myptr);
+        if (!found) {
+            return -ENOENT;
+        }
+        else {
+            found = 0;
+        }
+        k++;
+    }
     return -EOPNOTSUPP;
 }
 
 static void* fs_init(struct fuse_conn_info *conn);
+
+/**
+int main(int argc, char **argv){
+    char* mpath = "/users/documents/test.txt";
+    char* arr[20];
+    int num = 20;
+    int m = parse(mpath, arr, num);
+    int n = translate(mpath);
+    printf("Num from parse: %d, mpath: %s, num from translate: %d\n", m, mpath, n);
+    
+    return 0;
+} */
 
 /**
  *  Return inode number for path to specified file
@@ -194,8 +278,51 @@ static void* fs_init(struct fuse_conn_info *conn);
  */
 static int translate_1(const char *path, char *leaf)
 {
-	// note: make copy of path before passing to parse()
-    return -EOPNOTSUPP;
+    // note: make copy of path before passing to parse()
+    char *tokens[64] = {NULL};
+    char *_path = strdup(path);
+    int n_tokens = parse(_path, tokens, 64);
+    memset(leaf, 0, FS_FILENAME_SIZE);
+    if (n_tokens > 0){
+        strncpy(leaf, tokens[n_tokens - 1], strlen(tokens[n_tokens - 1]));
+    } else {
+        return -ENOENT; // if no tokens available
+    }
+    int index = 0;
+    struct fs_inode temp;
+    struct fs_dirent *fd;
+    char *token = tokens[index];
+    int inum = 1;
+    void *block = malloc(FS_BLOCK_SIZE);
+    while(tokens[index + 1] != NULL) {
+        temp = inodes[inum];
+        if (disk->ops->read(disk, temp.direct[0], 1, block)) {
+            exit(2);
+        }
+        fd = block;
+        int i = 0;
+        for (i = 0; i < DIRENTS_PER_BLK; i++) {
+            if (fd->valid && !strcmp(token, fd->name)) {
+                if (tokens[i + 1] != NULL && !(fd->isDir)) {
+                    free(block);
+                    return -ENOTDIR;
+                }
+                inum = fd->inode;
+                break;
+            }
+            fd++;
+        }
+        if (i == DIRENTS_PER_BLK) {
+            free(block);
+            return -ENOENT;
+        }
+        token = tokens[++index];
+    }
+    
+    if (block) {
+        free(block);
+    }
+    return inum;
 }
 
 /**
@@ -222,6 +349,23 @@ static void flush_metadata(void)
             dirty[i] = NULL;
         }
     }
+}
+
+
+/**
+ * Flush all the inode map to disk
+ */
+static void flush_inode_map(void) {
+    int inode_map_sz = 1;   // 1 block
+    disk->ops->write(disk, 1, inode_map_sz, inode_map);
+}
+
+
+/**
+ * Flush all the block map to disk
+ */
+static void flush_block_map(void) {
+    disk->ops->write(disk, 1 + inode_map_sz, block_map_sz, block_map);
 }
 
 /**
@@ -289,7 +433,7 @@ static void return_inode(int inum)
  */
 static int find_dir_entry(struct fs_dirent *de, const char *name)
 {
-    for(int entryNum=0; entryNum<32; entryNum++){
+    for(int entryNum=0; entryNum<DIRENTS_PER_BLK; entryNum++){
         if(strcmp(de->name, name)==0){
             return entryNum;
         }
@@ -307,7 +451,7 @@ static int find_dir_entry(struct fs_dirent *de, const char *name)
  */
 static int find_in_dir(struct fs_dirent *de, const char *name)
 {
-    for(int i=0; i<32; i++){
+    for(int i=0; i<DIRENTS_PER_BLK; i++){
         if(strcmp(de->name, name)==0){
             return de->inode;
         }
@@ -324,7 +468,7 @@ static int find_in_dir(struct fs_dirent *de, const char *name)
  */
 static int find_free_dir(struct fs_dirent *de)
 {
-    for(int entryNum=0; entryNum<32; entryNum++){
+    for(int entryNum=0; entryNum<DIRENTS_PER_BLK; entryNum++){
         if((de->valid)==0){
             return entryNum;
         }
@@ -341,7 +485,7 @@ static int find_free_dir(struct fs_dirent *de)
  */
 static int is_empty_dir(struct fs_dirent *de)
 {
-    for(int i=0; i<32; i++){
+    for(int i=0; i<DIRENTS_PER_BLK; i++){
         if(de->valid==1){
             return 0;
         }
@@ -350,8 +494,9 @@ static int is_empty_dir(struct fs_dirent *de)
     return 1;
 }
 
-
-/** Helper function for getBlk which allocates the nth block if it does not exist */
+/** Helper function for getBlk which allocates the nth block if it does not exist
+ *  provided alloc = 1 is passed as parameter
+ */
 
 static int allocate_nth_block(struct fs_inode *in, int n){
     
@@ -360,43 +505,58 @@ static int allocate_nth_block(struct fs_inode *in, int n){
     // if n < 6, allocate a free block at nth index
     if(n < N_DIRECT){
         int freeBlk = get_free_blk();
+        if(freeBlk==0){
+            return -ENOSPC;
+        }
         in->direct[n] = freeBlk;
-        FD_SET(freeBlk, block_map);
+        FD_SET(freeBlk, block_map);             // this may not be required??
         ret = freeBlk;
     }
-    // n is > 6 or < 256, allocate a block in the indir1 blocks
+    
+    // n is > 6 or < 262, allocate a block in the indir1 blocks
     else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
+        
         // if this is the very first block in the indir1 blocks, first allocate block for indir1. Then allocate data block inside indir1
         uint32_t indir_block_1 = in->indir_1;
-        if(n==N_DIRECT){
-            int freeBlkForIndir1 = get_free_blk();      // allocate block for indir1
-            indir_block_1 = freeBlkForIndir1;
-        }
         
-        printf("Ptrs per blk: %d, indirBlk: %d\n", PTRS_PER_BLK, indir_block_1);
+        if(n==N_DIRECT){            // when this is the very first indir block
+            int freeBlkForIndir1 = get_free_blk();
+            if(freeBlkForIndir1==0){
+                return 0;
+            }
+            indir_block_1 = freeBlkForIndir1;
+            in->indir_1 = indir_block_1;            // allocate block for indir1
+        }
+
         int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
             exit(2);
         }
         
         // find free block from block map
-        int freeBlkNum = get_free_blk();                // allocate block for data
+        int freeBlkNum = get_free_blk();            // allocate block for data in indir1
+        if(freeBlkNum==0){
+            return 0;
+        }
         // add free block to the nth block position
         ptr_to_indir1[n-N_DIRECT] = freeBlkNum;
-        // set block num to allocated in blockmap
-        FD_SET(freeBlkNum, block_map); // returns nth block from indirect blocks
-        ret = freeBlkNum;
-        
+        ret = freeBlkNum;                       // returns nth block from indirect blocks
+            
     }
+    
     // if n >= 262, allocate a free block to the indir2 blocks
     else if(n >= (N_DIRECT + PTRS_PER_BLK)){
         
-        uint32_t indir_block_2 = in->indir_1;
+        uint32_t indir_block_2 = in->indir_2;
         
-        // if nth block is the very first block in the indir blocks, first allocate a block for indir2
+        // if nth block is the very first block in the indir2 blocks, first allocate a block for indir2
         if(n==N_DIRECT + PTRS_PER_BLK){
             int freeBlkForIndir2 = get_free_blk();      // allocate block for indir2
+            if(freeBlkForIndir2 == 0) {
+                return 0;
+            }
             indir_block_2 = freeBlkForIndir2;
+            in->indir_2 = freeBlkForIndir2;                // update in inode
         }
         
         // if this is not the very first indir2 block, perform computation to find correct location to add free block
@@ -406,18 +566,25 @@ static int allocate_nth_block(struct fs_inode *in, int n){
         if (disk->ops->read(disk, indir_block_2, 1, ptr_to_indir2) < 0) {
             exit(2);
         }
-        // find the block index in indirect2 block that we will read, get ceil
-        // ceil(738 / 256) = 3.0
+        
+        // find index at which we will allocate a block inside indir2 block
         double index_from_indir2 = (ceil)(adjusted_n / PTRS_PER_BLK);
         // convert to int = 3 for dereferencing
         int index_from_indir2_int = (int)(index_from_indir2);
         
-        // get free block to allocate inside indir2
-        int freeBlkInsideIndir2 = get_free_blk();       // first level block alloc
+        int freeBlkInsideIndir2 = 0;
+        if(adjusted_n % FS_BLOCK_SIZE == 0) {
+            // get free block to allocate inside indir2
+            freeBlkInsideIndir2 = get_free_blk();       // first level block alloc
+            if(freeBlkInsideIndir2 == 0){
+                return 0;
+            }else{
+                ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
+            }
         
-        // set second level block in indir2 inside which we will allocate our data block
-        ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
-        FD_SET(freeBlkInsideIndir2, block_map);
+            // set second level block in indir2 inside which we will allocate our data block
+            ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
+        }
         
         int* myptr = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, freeBlkInsideIndir2 , 1, myptr) < 0) {
@@ -427,6 +594,9 @@ static int allocate_nth_block(struct fs_inode *in, int n){
         int target_idx = adjusted_n % PTRS_PER_BLK;
         
         int finalindir2FreeBlk = get_free_blk();       // second level data block allocated
+        if(finalindir2FreeBlk == 0) {
+            return -ENOSPC;
+        }
         myptr[target_idx] = finalindir2FreeBlk;
         FD_SET(finalindir2FreeBlk, block_map);
         ret = finalindir2FreeBlk;
@@ -510,6 +680,10 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
     
 }
 
+static int fs_read(const char *path, char *buf, size_t len, off_t offset,
+                   struct fuse_file_info *fi);
+
+
 /* Fuse functions
  */
 
@@ -567,14 +741,20 @@ static void* fs_init(struct fuse_conn_info *conn)
     dirty = calloc(n_meta, sizeof(void*));  // ptrs to dirty metadata blks
 
     /* your code here */
-    // Testing lookup - delete later
-    int a = lookup(3, "file.0");
-    printf("Retval for file inode: %d\n", a);
+    //inode map size
+    inode_map_sz = sb.inode_map_sz;
+    block_map_sz = sb.block_map_sz;
+    inode_reg_sz = sb.inode_region_sz;
     
-    // testing get free block method - delete later
-    int d = get_free_blk();
-    printf("Free block: %d\n", d);
-
+    /**
+    int len = 2000;
+    off_t offset = 1200;
+    struct fuse_file_info* fi;
+    char* buf = malloc(len);
+    int num = fs_read("/file.7", buf, len, offset, fi);
+    printf("Bytes read: %d\n", num);
+    */
+    
     return NULL;
 }
 
@@ -587,6 +767,24 @@ static void* fs_init(struct fuse_conn_info *conn)
  * ENOTDIR - an intermediate component of the path (e.g. 'b' in
  *           /a/b/c) is not a directory
  */
+
+static void fs_set_attrs(struct fs_inode *inode, struct stat *sb, int inum) {
+     
+     //set attrs from inode to sb
+     sb->st_ino = inum;
+     sb->st_blocks = (inode->size - 1) / FS_BLOCK_SIZE + 1;
+     sb->st_mode = inode->mode;
+     sb->st_size = inode->size;
+     sb->st_uid = inode->uid;
+     sb->st_gid = inode->gid;
+     //set time
+     sb->st_ctime = inode->ctime;
+     sb->st_mtime = inode->mtime;
+     sb->st_atime = sb->st_mtime;
+     sb->st_nlink = 1;
+    
+}
+
 
 /**
  * getattr - get file or directory attributes. For a description of
@@ -606,7 +804,16 @@ static void* fs_init(struct fuse_conn_info *conn)
  */
 static int fs_getattr(const char *path, struct stat *sb)
 {
-    return -EOPNOTSUPP;
+    int inode_num = translate(path); // read the inode number from the given path
+    
+    if (inode_num == -ENOENT || inode_num == -ENOTDIR) {
+        return inode_num;
+    }
+    
+    struct fs_inode the_inode = inodes[inode_num];
+    fs_set_attrs(&the_inode, sb, inode_num);
+    
+    return 0;
 }
 
 /**
@@ -631,6 +838,45 @@ static int fs_getattr(const char *path, struct stat *sb)
 static int fs_readdir(const char *path, void *ptr, fuse_fill_dir_t filler,
 		       off_t offset, struct fuse_file_info *fi)
 {
+    struct stat sb;
+    int rtv = fs_getattr(path, &sb);
+    //return if there is any error from getattr
+    if(rtv == -ENOENT || rtv == -ENOTDIR) {
+        return rtv;
+    }
+    
+    struct fs_inode inode = inodes[sb.st_ino];
+    //check if the inode is a directory
+    if(!S_ISDIR(inode.mode)) {
+        return -ENOTDIR;
+    }
+    
+    //request memory of block size
+    void *block = malloc(FS_BLOCK_SIZE);
+    //read information of the inode's d-entries block from disk into block
+    disk->ops->read(disk, inode.direct[0], 1, block);
+    struct fs_dirent *fd = block;
+    
+    int i;
+    for(i = 0; i < DIRENTS_PER_BLK; i++) {
+        if(fd->valid) {
+            //reset sb
+            memset(&sb, 0, sizeof(sb));
+            //get inode
+            inode = inodes[fd->inode];
+            //set attrs of inode to sb
+            fs_set_attrs(&inode, &sb, fd->inode);
+            //fill
+            filler(ptr, fd->name, &sb, 0);
+        }
+        fd++;
+    }
+    
+    if(block) {
+        free(block);
+    }
+    
+    return 0;
     return -EOPNOTSUPP;
 }
 
@@ -666,6 +912,14 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
+
+//write all the inode to the disk
+static void write_all_inodes() {
+    struct fs_super sb;
+    disk->ops->write(disk, (1 + sb.inode_map_sz + sb.block_map_sz), sb.inode_region_sz, inodes);
+}
+
+
 /**
  * mknod - create a new file with permissions (mode & 01777)
  * minor device numbers extracted from mode. Behavior undefined
@@ -687,7 +941,127 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
  */
 static int fs_mknod(const char *path, mode_t mode, dev_t dev)
 {
-    return -EOPNOTSUPP;
+    char file_name[FS_FILENAME_SIZE];
+    char *_path = strdup(path);
+    int child_inode = translate(_path);
+    _path = strdup(path);
+    int parent_inode = translate_1(_path, file_name);
+    
+    printf("In mknod function...reach to the stage 0, returned from child_inode and parent_inode\n");
+    
+    /*
+     * If parent path contains a intermediate component which is not a directory
+     * or a component of the path is not present
+     */
+    if(parent_inode == -ENOTDIR || parent_inode == -ENOENT) {
+        return parent_inode;
+    }
+    struct fs_inode p_inode = inodes[parent_inode];
+    if (!S_ISDIR(p_inode.mode)) {
+        return ENOTDIR;
+    }
+    printf("In mknode function...reach to stage 1\n"
+           "checked parent path true..\n"
+           "parent inode number is: %d\n", parent_inode);
+    
+    /*
+     * If child file alreayd exist
+     */
+    if (child_inode > 0) {
+        printf("In mknode function...child_file exist, child inode is: %d (checking existence)\n", child_inode);
+        return EEXIST;
+    }
+    printf("In mknode function...reach to stage 2 (checking existence)\n");
+    
+    int free_inode = get_free_inode();
+    if (free_inode == -ENOSPC) {
+        return -ENOSPC;
+    }
+    printf("In mknode function...reach to stage 3 (getting free inode : %d)\n", free_inode);
+    /*
+     * create inode in the parent directory
+     */
+    void *parent_directory_block = malloc(FS_BLOCK_SIZE);
+    if (disk->ops->read(disk, p_inode.direct[0], 1, parent_directory_block) < 0) {
+        exit(2);
+    }
+    printf("In mknode function...reach to stage 4(read parent block)\n");
+    struct fs_dirent* entry = parent_directory_block;
+    struct fs_dirent* entryStart = entry;
+    struct fs_inode new_inode = inodes[free_inode];
+    int free_entry_idx = find_free_dir(entryStart);
+    
+    if (free_entry_idx == -ENOSPC) {
+        if (parent_directory_block) {
+            free(parent_directory_block);
+        }
+        if (FD_ISSET(free_inode, inode_map)) {
+            FD_CLR(free_inode, inode_map);
+            flush_inode_map();
+        }
+        return -ENOSPC;
+    }
+    printf("In mknode function...reach to stage 5(find free entry index : %d)\n", free_entry_idx);
+    //todo, create new directory entry and inode of the entry
+    entry = entry + free_entry_idx;
+    memset(entry, 0, sizeof(struct fs_dirent));
+    strncpy(entry->name, file_name, strlen(file_name));
+    entry->valid = 1;
+    entry->isDir = S_ISDIR(mode);
+    entry->inode = free_inode;
+    printf("In mknode function...reach to stage 6\n"
+           "(set the name for the dir_entry: %s, the inode_num: %d)\n", entry->name, entry->inode);
+    
+    /*set the inode attributes*/
+    struct fuse_context *context = fuse_get_context();
+    time_t current_time = time(NULL);
+    new_inode.ctime = current_time;
+    new_inode.mtime = current_time;
+    //new_inode.gid =(uint16_t) getgid();
+    new_inode.gid = context->gid;
+    new_inode.uid = context->uid;
+    //new_inode.uid =(uint16_t) getuid();
+    new_inode.mode = mode;
+    
+    
+    for (int i = 0; i < 6; i++) {
+        new_inode.direct[i] = 0;
+    }
+    new_inode.indir_1 = 0;
+    new_inode.indir_2 = 0;
+    printf("In mknode function...reach to stage 7\n");
+    /*allocate a block to the directory if the inode is a directory*/
+    if (S_ISDIR(mode)) {
+        int free_block = get_free_blk();
+        if (free_block == -ENOSPC) {
+            return_inode(free_inode);
+            flush_inode_map();
+            free(parent_directory_block);
+            return -ENOSPC;
+        }
+        new_inode.direct[0] = free_block;
+        flush_block_map();
+        
+        void *block_dir = malloc(FS_BLOCK_SIZE);
+        memset(block_dir, 0, FS_BLOCK_SIZE);
+        disk->ops->write(disk, free_block, 1, block_dir);
+        free(block_dir);
+    }
+    printf("In mknode function...reach to stage 8\n");
+    
+    flush_inode_map();
+    printf("In mknode function...reach to stage 8-1\n");
+    
+    inodes[free_inode] = new_inode;
+    
+    write_all_inodes();
+    
+    printf("In mknode function...reach to stage 9\n");
+    
+    disk->ops->write(disk,p_inode.direct[0], 1, parent_directory_block);
+    printf("In mknode function...reach to stage 10\n");
+    free(parent_directory_block);
+    return 0;
 }
 
 /**
@@ -706,8 +1080,57 @@ static int fs_mknod(const char *path, mode_t mode, dev_t dev)
  */ 
 static int fs_mkdir(const char *path, mode_t mode)
 {
-    return -EOPNOTSUPP;
+    mode = mode | S_IFDIR;
+    int ret = fs_mknod(path, mode, 0);
+    return ret;
 }
+
+
+static void truncate_indir_1(int blk_num) {
+    
+    int num_per_blk = BLOCK_SIZE / sizeof(uint32_t);
+    
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+    
+    memset(buffer, 0, BLOCK_SIZE);
+    
+    // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+    
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+            FD_CLR(buffer[i], block_map);
+    }
+    
+    FD_CLR(blk_num, block_map);
+}
+
+/* clear the indir2 blocks of file
+ */
+static void truncate_indir_2(int blk_num) {
+    int num_per_blk = BLOCK_SIZE / sizeof(uint32_t);
+    
+    // read from blocks
+    uint32_t buffer[num_per_blk];
+    
+    memset(buffer, 0, BLOCK_SIZE);
+    
+    // read directory
+    if (disk->ops->read(disk, blk_num, 1, buffer) < 0)
+        exit(1);
+    
+    // clear the blocks
+    for (int i = 0; i < num_per_blk; i++) {
+        if (buffer[i])
+            truncate_indir_1(buffer[i]);
+    }
+    
+    FD_CLR(blk_num, block_map);
+}
+
 
 /**
  * truncate - truncate file to exactly 'len' bytes.
@@ -727,11 +1150,77 @@ static int fs_truncate(const char *path, off_t len)
     /* you can cheat by only implementing this for the case of len==0,
      * and an error otherwise.
      */
+    /* invalid argument when len is not zero */
     if (len != 0) {
-    	return -EINVAL;		/* invalid argument */
+        return -EINVAL;
     }
-    return -EOPNOTSUPP;
+    
+    int inum = translate(path);
+    
+    
+    if (inum < 0) {
+        return -ENOENT;
+    } else if (S_ISDIR(inodes[inum].mode)) {
+        return -EISDIR;
+    }
+    
+    
+    struct fs_inode *inode = &inodes[inum];
+    
+    // clear the block of the inode
+    for (int i = 0; i < N_DIRECT; i++) {
+        if (inode->direct[i])
+            FD_CLR(inode->direct[i], block_map);
+        inode->direct[i] = 0;
+    }
+    
+    // clear indirect blocks if it exists
+    if (inode->indir_1) {
+        truncate_indir_1(inode->indir_1);
+    }
+    
+    // clear indir 2 blocks if it exists
+    if (inode->indir_2) {
+        truncate_indir_2(inode->indir_2);
+    }
+    
+    // set size
+    inode->size    = 0;
+    inode->indir_1 = 0;
+    inode->indir_2 = 0;
+    
+    //write back to the device
+    write_all_inodes();
+    
+    if (disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0)
+        exit(1);
+    if (disk->ops->write(disk,block_map_base,inode_base - block_map_base,block_map) < 0)
+        exit(1);
+    
+    return 0;
 }
+
+
+/**
+ * get_leaf - get the leaf name
+ *
+ */
+
+char *get_leaf(char *path) {
+    
+    char *token = NULL;
+    char *tokens[64] = {NULL};
+    int i = 0;
+    //tokenize the string
+    token = strtok(path, "/");
+    while (token) {
+        tokens[i++] = token;
+        token = strtok(NULL, "/");
+    }
+    
+    return tokens[--i];
+}
+
 
 /**
  * unlink - delete a file.
@@ -746,7 +1235,62 @@ static int fs_truncate(const char *path, off_t len)
  */
 static int fs_unlink(const char *path)
 {
-    return -EOPNOTSUPP;
+    int i = 0;
+    int inum = fs_truncate(path, 0);
+    if (inum < 0)
+        return inum;
+    
+    char dir_name[FS_FILENAME_SIZE];
+    char *Apath = path;
+    int parent_inum = translate_1(Apath, dir_name);
+    Apath = path;
+    char *last = dir_name;
+    
+    last = get_leaf(Apath);
+    
+    
+    struct fs_inode parent_dir = inodes[parent_inum];
+    struct fs_dirent *block = (struct fs_dirent *) malloc(FS_BLOCK_SIZE);
+    disk->ops->read(disk, parent_dir.direct[0], 1, block);
+    
+    
+    // find the inode entry and clear it
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        
+        if (block[i].valid == 0) {
+            continue;
+        }
+        
+        if (strcmp(block[i].name, last) == 0) {
+            //delete it
+            if (block[i].isDir) {
+                return -EISDIR;
+            }
+            int file_inode_num = block[i].inode;
+            struct fs_inode fileinode = inodes[file_inode_num];
+            if (FD_ISSET(file_inode_num, inode_map)) {
+                //clear the inode
+                FD_CLR(file_inode_num, inode_map);
+                fileinode.size = 0;
+                fileinode.mtime = time(NULL);
+                block[i].valid = 0;
+                inodes[file_inode_num] = fileinode;
+                break;
+            }
+        }
+    }
+    
+    
+    if (i > 31) {
+        return -ENOENT;
+    }
+    //write everything back to disk(inode map and inodes)
+    disk->ops->write(disk, parent_dir.direct[0], 1, block);
+    write_all_inodes();
+    write_inode_map();
+    free(block);
+    
+    return 0;
 }
 
 /**
@@ -763,8 +1307,86 @@ static int fs_unlink(const char *path)
  */
 static int fs_rmdir(const char *path)
 {
-    return -EOPNOTSUPP;
+    // in case of trying to remove root dir
+    if (strcmp(path, "/") == 0)
+        return -EINVAL;
+    
+    
+    char* _path = strdup(path);
+    
+    // get the inode of the directory
+    int inode = translate(_path);
+    
+    struct fs_dirent *dirEntry =  (struct fs_dirent*) malloc(FS_BLOCK_SIZE);
+    
+    if (disk->ops->read(disk, inodes[inode].direct[0], 1, dirEntry) < 0) {
+        exit(2);
+    }
+    
+    if (inode < 0) {
+        return -ENOENT;
+    } else if (!S_ISDIR(inodes[inode].mode)) {
+        return -ENOTDIR;
+    } else if (!is_empty_dir(dirEntry)) {
+        return -ENOTEMPTY;
+    }
+    
+    
+    // clear the parent's block
+    memset(dirEntry, 0, FS_BLOCK_SIZE);
+    
+    if (disk->ops->write(disk, inodes[inode].direct[0], 1, dirEntry) < 0){
+        exit(1);
+    }
+    
+    return_blk(inodes[inode].direct[0]);
+    
+    inodes[inode].direct[0] = 0;
+    if (disk->ops->write(disk, block_map_base, 1, block_map) < 0){
+        exit(1);
+    }
+    
+    char* leaf = malloc(sizeof(char*));
+    int parent_inum = translate_1(_path, leaf);
+    if(parent_inum < 0){
+        return parent_inum;
+    }
+    //get the parent inode
+    struct fs_inode* parent_node = &inodes[parent_inum];
+    if(!S_ISDIR(parent_node->mode)){
+        return -ENOTDIR;
+    }
+    //get the dirents of parent inode
+    
+    struct fs_dirent* dirents = calloc(1, FS_BLOCK_SIZE);
+    
+    if (disk->ops->read(disk, parent_node->direct[0], 1, dirents) < 0){
+        exit(2);
+    }
+    
+    for(int i = 0; i < DIRENTS_PER_BLK; i++){
+        if(dirents[i].valid && strcmp(dirents[i].name, leaf) == 0){
+            dirents[i].valid = 0;
+            return_blk(inode);
+            break;
+        }
+    }
+    
+    if (disk->ops->write(disk, parent_node->direct[0], 1, dirents) < 0){
+        exit(1);
+    }
+    
+    if(disk->ops->write(disk, inode_map_base, block_map_base - inode_map_base, inode_map) < 0) {
+        exit(1);
+    }
+    
+    free(dirents);
+    free(dirEntry);
+    free(leaf);
+    free(_path);
+    return 0;
 }
+
 
 /**
  * rename - rename a file or directory.
@@ -786,8 +1408,72 @@ static int fs_rmdir(const char *path)
  */
 static int fs_rename(const char *src_path, const char *dst_path)
 {
+    //get the old name from src_path
+    char the_old_name[FS_FILENAME_SIZE];
+    char *tmp_path = strdup(src_path);
+    //get_parent_inum
+    int prev_pinum = translate_1(tmp_path, the_old_name);
+    
+    tmp_path = strdup(src_path);
+    //translate_path_to_inum
+    int curr_inum = translate(tmp_path);
+    
+    char the_new_name[FS_FILENAME_SIZE];
+    tmp_path = strdup(dst_path);
+    int new_pinum = translate_1(tmp_path, the_new_name);
+    
+    if (curr_inum == -ENOTDIR || curr_inum == -ENOENT) {
+        return curr_inum;
+    }
+    
+    if (prev_pinum != new_pinum) {
+        return -EINVAL;
+    }
+    
+    struct fs_inode parent_inode = inodes[prev_pinum];
+    void *block = malloc(FS_BLOCK_SIZE);
+    disk->ops->read(disk, parent_inode.direct[0], 1, block);
+    struct fs_dirent *entry = block;
+    
+    /* to check if destination is not present */
+    int i = 0;
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        if (!strcmp(entry->name, the_new_name)) {
+            if (block) {
+                free(block);
+            }
+            return -EEXIST;
+        }
+        entry++;
+    }
+    
+    /* update name of matching inode */
+    entry = block;
+    for (i = 0; i < DIRENTS_PER_BLK; i++) {
+        if (entry->inode == curr_inum) {
+            strncpy(entry->name, the_new_name, strlen(the_new_name));
+            struct fs_inode inode = inodes[curr_inum];
+            inode.ctime = time(NULL);
+            inodes[curr_inum] = inode;
+            write_all_inodes();
+            break;
+        }
+        entry++;
+    }
+    
+    /* write back to disk */
+    disk->ops->write(disk, parent_inode.direct[0], 1, block);
+    
+    /* free previously allocated memory */
+    if (block) {
+        free(block);
+    }
+    
+    return 0;
+
     return -EOPNOTSUPP;
 }
+
 
 /**
  * chmod - change file permissions
@@ -803,7 +1489,30 @@ static int fs_rename(const char *src_path, const char *dst_path)
  */
 static int fs_chmod(const char *path, mode_t mode)
 {
-    return -EOPNOTSUPP;
+    struct stat sb;
+    int rtv = fs_getattr(path, &sb);
+    
+    // check if there was any error when the path is being resolved.
+    if (rtv == -ENOENT || rtv == -ENOTDIR) {
+        return rtv;
+    }
+    
+    struct fs_inode inode = inodes[sb.st_ino];
+    
+    // update the mode of the directory or the file.
+    if (S_ISDIR(inode.mode)) {  //if it is a directory
+        inode.mode = (S_IFDIR | mode);
+    } else if (S_ISREG(inode.mode)) {  //if it is a regular file
+        inode.mode = (S_IFREG | mode);
+    }
+    
+    // update the ctime for the inode
+    inode.ctime = time(NULL);
+    
+    // finally write to the disk
+    inodes[sb.st_ino] = inode;
+    write_all_inodes();
+    return 0;
 }
 
 /**
@@ -819,7 +1528,23 @@ static int fs_chmod(const char *path, mode_t mode)
  */
 static int fs_utime(const char *path, struct utimbuf *ut)
 {
-    return -EOPNOTSUPP;
+    struct stat sb;
+    int rtv = fs_getattr(path, &sb);
+    
+    // check for error
+    if (rtv == -ENOENT || rtv == -ENOTDIR) {
+        return rtv;
+    }
+    
+    struct fs_inode inode = inodes[sb.st_ino];
+    
+    // update modification time for the directory or file type.
+    inode.mtime = ut->modtime;
+    
+    // write to disk
+    inodes[sb.st_ino] = inode;
+    write_all_inodes();
+    return 0;
 }
 
 /**
@@ -875,7 +1600,7 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
     // find total no. of blocks we will read
     int numBlocksToRead = (int)(lastBlkIndex - startBlkIndex + 1);
     printf("Total blocks to read: %d\n", numBlocksToRead);
-    
+
     
     void* myPtr = malloc(FS_BLOCK_SIZE);
     int numBytes = 0;
@@ -883,15 +1608,15 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
     
     for(int i=0; i<numBlocksToRead; i++){
         
-        //off_t adjustedOffset = FS_BLOCK_SIZE % offset;
+        //offset = offset % FS_BLOCK_SIZE;
         int entryBlockNum = get_blk(my_inode, startBlkIndex, 1);
         printf("block to read: %d\n", entryBlockNum);
         if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
             exit(2);
         }
         if(i==0){
-            offset = offset % FS_BLOCK_SIZE;            // rounding up offset
             // copies bytes from myPtr to buf, excludes no. of bytes in offset
+            offset = offset % FS_BLOCK_SIZE;
             bytesToCopy = FS_BLOCK_SIZE-offset;
             memcpy(buf, myPtr + offset, bytesToCopy);
             //adjustedOffset = 0;
@@ -937,7 +1662,88 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
 static int fs_write(const char *path, const char *buf, size_t len,
 		     off_t offset, struct fuse_file_info *fi)
 {
-    return -EOPNOTSUPP;
+    // get inode number & find instantiate inode
+    int inum = translate(path);
+    // if path not valid, return error
+    if(inum == -ENOENT){
+        return -ENOENT;
+    }
+    // get inode
+    struct fs_inode* my_inode = inodes + inum;
+    int my_inode_size = my_inode->size;
+    printf("File size: %d, offset: %d\n", my_inode_size, offset);
+    if(offset >= my_inode_size){
+        return -EINVAL;
+    }
+    
+    // find the first byte to begin reading
+    int firstByteToRead = offset;
+    // find the last byte to be read in file
+    int lastByteToRead = firstByteToRead + len;
+    printf("First byte: %d, last byte: %d\n", firstByteToRead, lastByteToRead);
+    // find starting block to read - gets the nth block in the file
+    float startBlkIndex = (floor(firstByteToRead / FS_BLOCK_SIZE));
+    // find last block to read
+    float lastBlkIndex = (floor(lastByteToRead / FS_BLOCK_SIZE));
+    printf("First block to read: %d, Last block: %d\n", (int)startBlkIndex, (int)lastBlkIndex);
+    
+    // find total no. of blocks we will read
+    int numBlocksToWrite = (int)(lastBlkIndex - startBlkIndex + 1);
+    printf("Total blocks to read: %d\n", numBlocksToWrite);
+    
+    void* myPtr = malloc(FS_BLOCK_SIZE);
+    int bytesToWrite = 0;
+    int length = len;
+    
+    for (int i = 0; i < numBlocksToWrite; i++){
+        //off_t adjustedOffset = FS_BLOCK_SIZE % offset;
+        int entryBlockNum = get_blk(my_inode, startBlkIndex, 0);
+        if (entryBlockNum == 0) {
+            free(myPtr);
+            return len - length;
+        }
+        
+        printf("block to write: %d\n", entryBlockNum);
+        if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
+            exit(2);
+        }
+        if (i == 0) {
+            bytesToWrite = FS_BLOCK_SIZE - offset % FS_BLOCK_SIZE;
+            if (length < bytesToWrite) {
+                bytesToWrite = length;
+                length = 0;
+            } else {
+                length -= bytesToWrite;
+            }
+            char *start = myPtr + offset % FS_BLOCK_SIZE;
+            memcpy(start, buf, bytesToWrite);
+        } else if(i==numBlocksToWrite-1){
+            bytesToWrite = len - length;
+            length -= bytesToWrite;
+            char *start = myPtr;
+            memcpy(start, buf, bytesToWrite);
+        } else {
+            char *start = myPtr;
+            bytesToWrite = FS_BLOCK_SIZE;
+            length -= bytesToWrite;
+            memcpy(start, buf, bytesToWrite);
+        }
+        buf += bytesToWrite;
+        my_inode->size += bytesToWrite;
+        my_inode = inodes + inum;
+        write_all_inodes();
+        disk->ops->write(disk, entryBlockNum, 1, myPtr);
+        if (length == 0) break;
+        startBlkIndex++;
+    }
+    
+    
+    
+    struct utimbuf ut;
+    ut.modtime = time(NULL);
+    fs_utime(path, &ut);
+    free(myPtr);
+    return len - length;
 }
 
 /**
@@ -954,7 +1760,20 @@ static int fs_write(const char *path, const char *buf, size_t len,
  */
 static int fs_open(const char *path, struct fuse_file_info *fi)
 {
-    return 0;
+    struct stat sb;
+    int inum = translate(path);
+    if(inum==ENOENT){
+        return ENOENT;
+    }else if(inum==ENOTDIR){
+        return ENOTDIR;
+    }else if(inum==EISDIR){
+        return EISDIR;
+    }
+    else{
+        sb.st_ino = inum;
+        return 0;
+    }
+    
 }
 
 /**
