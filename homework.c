@@ -140,17 +140,14 @@ static int lookup(int inum, const char *name)
 static int parse(char *path, char *names[], int nnames)
 {
     char *token = NULL;
-    //char mpath[40] = "/users/documents/test.txt/..";
     char mpath[40];
     strcpy(mpath, path);
     char* delim = "/";
     names[nnames] = NULL;
     int num_tokens = 0;
-    //char *mydelim = "/";
     
     /* get the first token */
     token = strtok(mpath, delim);
-    //names[0] = token;
     
     int i = 0;
     /* walk through other tokens */
@@ -159,7 +156,6 @@ static int parse(char *path, char *names[], int nnames)
             char *tokenCopy = malloc(strlen(token));
             strcpy(tokenCopy, token);
             names[i] = tokenCopy;
-            //printf( " %s\n", names[i] );
             i++;
             num_tokens++;
         }
@@ -167,7 +163,7 @@ static int parse(char *path, char *names[], int nnames)
         
         
     }
-    printf("No. of tokens: %d\n", num_tokens);
+    
 	return num_tokens;
 }
 
@@ -188,7 +184,6 @@ static int translate(const char *path)
     char* names[20];
     int num_tokens = parse(mypath, names, 20);
     for(int i=0; i<num_tokens; i++){
-        printf("child: %s\n", names[i]);
     }
     
     // getting all the child directories of the root node as all paths will start with root node
@@ -199,7 +194,7 @@ static int translate(const char *path)
     int found = 0;
     while(names[k]!=NULL && k < num_tokens) {
         found = 0;      // reset found to 0 as we search for next component
-        printf("Handling token:%s\n",names[k]);
+        
         void *myptr = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, prevBlockNum, 1, myptr) < 0) {
             exit(2);
@@ -208,9 +203,9 @@ static int translate(const char *path)
 
         for(int j=0; j<32; j++) {
             
-            //printf("token name: %s, entry name: %s\n", names[k], dp->name);
+            
             if(strcmp(names[k], dp->name)==0){
-                printf("token name: %s, entry name2: %s j:%d valid:%d\n", names[k], dp->name, j, dp->valid);
+                
                 if(dp->valid){
                     
                     if (dp->isDir) {
@@ -222,10 +217,10 @@ static int translate(const char *path)
                     //This is a file
                     else {
                         if(k == (num_tokens-1)){
-                            printf("k: %d, numToken: %d\n", k, num_tokens);
+                            
                             retVal = dp->inode;
                             found = 1;
-                            printf("Filename: %s, inode: %d\n", dp->name, retVal);
+                            
                             free(myptr);
                             return retVal;
                         } else {
@@ -494,6 +489,12 @@ static int is_empty_dir(struct fs_dirent *de)
     return 1;
 }
 
+//write all the inode to the disk
+static void write_all_inodes() {
+    struct fs_super sb;
+    disk->ops->write(disk, (1 + sb.inode_map_sz + sb.block_map_sz), sb.inode_region_sz, inodes);
+}
+
 /** Helper function for getBlk which allocates the nth block if it does not exist
  *  provided alloc = 1 is passed as parameter
  */
@@ -509,25 +510,26 @@ static int allocate_nth_block(struct fs_inode *in, int n){
             return -ENOSPC;
         }
         in->direct[n] = freeBlk;
-        FD_SET(freeBlk, block_map);             // this may not be required??
+        write_all_inodes();
         ret = freeBlk;
     }
     
     // n is > 6 or < 262, allocate a block in the indir1 blocks
-    else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
+    else if(n >= N_DIRECT && n < N_DIRECT + PTRS_PER_BLK){
         
         // if this is the very first block in the indir1 blocks, first allocate block for indir1. Then allocate data block inside indir1
         uint32_t indir_block_1 = in->indir_1;
         
-        if(n==N_DIRECT){            // when this is the very first indir block
+        if (n == N_DIRECT) {            // when this is the very first indir block
             int freeBlkForIndir1 = get_free_blk();
             if(freeBlkForIndir1==0){
                 return 0;
             }
             indir_block_1 = freeBlkForIndir1;
-            in->indir_1 = indir_block_1;            // allocate block for indir1
+            in->indir_1 = indir_block_1;         // allocate block for indir1
+            write_all_inodes();
         }
-
+        
         int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
             exit(2);
@@ -535,28 +537,31 @@ static int allocate_nth_block(struct fs_inode *in, int n){
         
         // find free block from block map
         int freeBlkNum = get_free_blk();            // allocate block for data in indir1
-        if(freeBlkNum==0){
+        if (freeBlkNum == 0) {
             return 0;
         }
         // add free block to the nth block position
         ptr_to_indir1[n-N_DIRECT] = freeBlkNum;
-        ret = freeBlkNum;                       // returns nth block from indirect blocks
-            
+        disk->ops->write(disk, indir_block_1, 1, ptr_to_indir1);
+        ret = freeBlkNum; // returns nth block from indirect blocks
+        free(ptr_to_indir1);
+        
     }
     
     // if n >= 262, allocate a free block to the indir2 blocks
-    else if(n >= (N_DIRECT + PTRS_PER_BLK)){
+    else if (n >= (N_DIRECT + PTRS_PER_BLK)) {
         
         uint32_t indir_block_2 = in->indir_2;
         
         // if nth block is the very first block in the indir2 blocks, first allocate a block for indir2
-        if(n==N_DIRECT + PTRS_PER_BLK){
+        if( n == N_DIRECT + PTRS_PER_BLK) {
             int freeBlkForIndir2 = get_free_blk();      // allocate block for indir2
-            if(freeBlkForIndir2 == 0) {
+            if (freeBlkForIndir2 == 0) {
                 return 0;
             }
             indir_block_2 = freeBlkForIndir2;
-            in->indir_2 = freeBlkForIndir2;                // update in inode
+            in->indir_2 = freeBlkForIndir2;   // update in inode
+            write_all_inodes();
         }
         
         // if this is not the very first indir2 block, perform computation to find correct location to add free block
@@ -568,22 +573,23 @@ static int allocate_nth_block(struct fs_inode *in, int n){
         }
         
         // find index at which we will allocate a block inside indir2 block
-        double index_from_indir2 = (ceil)(adjusted_n / PTRS_PER_BLK);
+        double index_from_indir2 = ceil(adjusted_n / PTRS_PER_BLK);
         // convert to int = 3 for dereferencing
         int index_from_indir2_int = (int)(index_from_indir2);
         
         int freeBlkInsideIndir2 = 0;
-        if(adjusted_n % FS_BLOCK_SIZE == 0) {
+        if ( adjusted_n % PTRS_PER_BLK == 0) {
             // get free block to allocate inside indir2
             freeBlkInsideIndir2 = get_free_blk();       // first level block alloc
-            if(freeBlkInsideIndir2 == 0){
+            if (freeBlkInsideIndir2 == 0) {
+                free(ptr_to_indir2);
                 return 0;
-            }else{
+            } else {
                 ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
+                disk->ops->write(disk,indir_block_2 , 1, ptr_to_indir2);
             }
-        
-            // set second level block in indir2 inside which we will allocate our data block
-            ptr_to_indir2[index_from_indir2_int] = freeBlkInsideIndir2;
+        } else {
+            freeBlkInsideIndir2 = ptr_to_indir2[index_from_indir2_int];
         }
         
         int* myptr = malloc(FS_BLOCK_SIZE);
@@ -598,11 +604,13 @@ static int allocate_nth_block(struct fs_inode *in, int n){
             return -ENOSPC;
         }
         myptr[target_idx] = finalindir2FreeBlk;
-        FD_SET(finalindir2FreeBlk, block_map);
+        disk->ops->write(disk, freeBlkInsideIndir2, 1,myptr);
+        free(myptr);
+        free(ptr_to_indir2);
         ret = finalindir2FreeBlk;
-        
     }
     return ret;
+    
 }
 
 /**
@@ -617,31 +625,31 @@ static int allocate_nth_block(struct fs_inode *in, int n){
  */
 static int get_blk(struct fs_inode *in, int n, int alloc)
 {
+
     // Let's assume n=1000 for inode 7 (size = 276177 bytes)
     float file_size_bytes = (float)in->size;
-    // convert bytes to block size
-    float file_size_blocks = (ceil)(file_size_bytes / FS_BLOCK_SIZE);
     
+    // convert bytes to block size
+    int file_size_blocks = (ceil)(file_size_bytes / FS_BLOCK_SIZE);
+
     /** adding code to check if nth block exists */
     // if nth block does not exist & alloc = 1, then allocate a free block to nth index
     if(file_size_blocks < n-1 && alloc==1){
         int ret = allocate_nth_block(in, n);
         return ret;
     }
-    // if nth block does not exist & alloc = 0, return error
-    else{
-        return 0;
-    }
+
     
     int retVal = -1;    // initialize retVal to -1 which is invalid block no
+    
     // if n is between 0 to 5, access the direct blocks = 6 blocks
     if(n < N_DIRECT){
         retVal = in->direct[n];
     }
     // if n is between 6 to 255: access indirect1 block
-    else if(n >= N_DIRECT || n < N_DIRECT + PTRS_PER_BLK){
+    else if(n >= N_DIRECT && n < N_DIRECT + PTRS_PER_BLK){
         int indir_block_1 = in->indir_1;
-        printf("Ptrs per blk: %d, indirBlk: %d\n", PTRS_PER_BLK, indir_block_1);
+        //printf("Ptrs per blk: %d, indirBlk: %d\n", PTRS_PER_BLK, indir_block_1);
         int* ptr_to_indir1 = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, indir_block_1, 1, ptr_to_indir1) < 0) {
             exit(2);
@@ -663,9 +671,11 @@ static int get_blk(struct fs_inode *in, int n, int alloc)
         double index_from_indir2 = (ceil)(adjusted_n / PTRS_PER_BLK);
         // convert to int = 3 for dereferencing
         int index_from_indir2_int = (int)(index_from_indir2);
+        
         // get block number that we will finally read from (second level block)
         // i.e. read from the third block in indirect2
         int block_num_in_indirect = ptr_to_indir2[index_from_indir2_int];
+        
         int* myptr = malloc(FS_BLOCK_SIZE);
         if (disk->ops->read(disk, block_num_in_indirect , 1, myptr) < 0) {
             exit(2);
@@ -745,15 +755,6 @@ static void* fs_init(struct fuse_conn_info *conn)
     inode_map_sz = sb.inode_map_sz;
     block_map_sz = sb.block_map_sz;
     inode_reg_sz = sb.inode_region_sz;
-    
-    /**
-    int len = 2000;
-    off_t offset = 1200;
-    struct fuse_file_info* fi;
-    char* buf = malloc(len);
-    int num = fs_read("/file.7", buf, len, offset, fi);
-    printf("Bytes read: %d\n", num);
-    */
     
     return NULL;
 }
@@ -913,10 +914,13 @@ static int fs_releasedir(const char *path, struct fuse_file_info *fi)
 }
 
 
-//write all the inode to the disk
-static void write_all_inodes() {
-    struct fs_super sb;
-    disk->ops->write(disk, (1 + sb.inode_map_sz + sb.block_map_sz), sb.inode_region_sz, inodes);
+/**
+ * write_inode_map - write the complete inode map to disk
+ *
+ */
+
+void write_inode_map() {
+    disk->ops->write(disk, 1, inode_map_sz, inode_map);
 }
 
 
@@ -1568,38 +1572,45 @@ static int fs_utime(const char *path, struct utimbuf *ut)
  * @param fi fuse file info
  * @return number of bytes actually read if successful, or -error number
  */
+
 static int fs_read(const char *path, char *buf, size_t len, off_t offset,
 		    struct fuse_file_info *fi)
 {
+    
     // get inode number & find instantiate inode
     int inum = translate(path);
     // if path not valid, return error
     if(inum == ENOENT){
-        return ENOENT;
+        return -ENOENT;
     }
     // get inode
     struct fs_inode* my_inode = inodes + inum;
     int my_inode_size = my_inode->size;
-    printf("File size: %d, offset: %d\n", my_inode_size, offset);
+    
+    // if offset & len requested exceeds file size, reset len
     if(offset + len > my_inode_size){
-        return EIO;
+        //return EIO;
+        len = my_inode_size - offset;
     }
     
     // find the first byte to begin reading
     int firstByteToRead = offset;
     // find the last byte to be read in file
     int lastByteToRead = firstByteToRead + len;
-    printf("First byte: %d, last byte: %d\n", firstByteToRead, lastByteToRead);
+    
+    // if offset exceeds the file size, read the number of bytes that are available to read from start to end of file (needed in case of repeated calls to read file in small increments)
+    if(offset > my_inode_size){
+        len = lastByteToRead - firstByteToRead;
+    }
+    
     // find starting block to read - gets the nth block in the file
     float startBlkIndex = (floor(firstByteToRead / FS_BLOCK_SIZE));
     // find last block to read
     float lastBlkIndex = (floor(lastByteToRead / FS_BLOCK_SIZE));
-    printf("First block to read: %d, Last block: %d\n", (int)startBlkIndex, (int)lastBlkIndex);
     
     
     // find total no. of blocks we will read
     int numBlocksToRead = (int)(lastBlkIndex - startBlkIndex + 1);
-    printf("Total blocks to read: %d\n", numBlocksToRead);
 
     
     void* myPtr = malloc(FS_BLOCK_SIZE);
@@ -1608,9 +1619,8 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
     
     for(int i=0; i<numBlocksToRead; i++){
         
-        //offset = offset % FS_BLOCK_SIZE;
-        int entryBlockNum = get_blk(my_inode, startBlkIndex, 1);
-        printf("block to read: %d\n", entryBlockNum);
+        int entryBlockNum = get_blk(my_inode, startBlkIndex, 0);
+       
         if (disk->ops->read(disk, entryBlockNum, 1, myPtr) < 0) {
             exit(2);
         }
@@ -1619,7 +1629,7 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
             offset = offset % FS_BLOCK_SIZE;
             bytesToCopy = FS_BLOCK_SIZE-offset;
             memcpy(buf, myPtr + offset, bytesToCopy);
-            //adjustedOffset = 0;
+            
         }
         else if(i==numBlocksToRead-1){
             bytesToCopy = len - numBytes;
@@ -1636,6 +1646,7 @@ static int fs_read(const char *path, char *buf, size_t len, off_t offset,
     free(myPtr);
     return numBytes;
 }
+
 
 /**
  *  write - write data to a file
